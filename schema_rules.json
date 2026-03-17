@@ -1,0 +1,63 @@
+{
+  "types": {
+    "Article": {
+      "required": ["headline", "datePublished", "author", "mainEntityOfPage"],
+      "recommended": ["dateModified", "image", "publisher", "description"]
+    },
+    "NewsArticle": {"extends": ["Article"]},
+    "BlogPosting": {"extends": ["Article"]},
+    "WebPage": {
+      "required": ["name", "url"],
+      "recommended": ["description", "breadcrumb"]
+    },
+    "MedicalWebPage": {"extends": ["WebPage"], "recommended": ["about"]},
+    "WebSite": {
+      "required": ["name", "url"],
+      "recommended": ["publisher", "potentialAction"]
+    },
+    "Organization": {
+      "required": ["name", "url"],
+      "recommended": ["logo|image", "sameAs"]
+    },
+    "Person": {
+      "required": ["name"],
+      "recommended": ["url", "sameAs"]
+    },
+    "BreadcrumbList": {
+      "required": ["itemListElement"],
+      "recommended": []
+    },
+    "FAQPage": {
+      "required": ["mainEntity"],
+      "recommended": []
+    },
+    "HowTo": {
+      "required": ["name", "step"],
+      "recommended": ["image", "totalTime", "supply", "tool"]
+    },
+    "VideoObject": {
+      "required": ["name", "description", "thumbnailUrl", "uploadDate"],
+      "recommended": ["duration", "contentUrl", "embedUrl"]
+    },
+    "ImageObject": {
+      "required": ["url|contentUrl"],
+      "recommended": ["height", "width"]
+    },
+    "Product": {
+      "required": ["name"],
+      "recommended": ["image", "description", "brand", "offers"]
+    },
+    "Recipe": {
+      "required": ["name", "recipeIngredient", "recipeInstructions"],
+      "recommended": ["image", "cookTime", "prepTime", "totalTime", "author"]
+    },
+    "Event": {
+      "required": ["name", "startDate", "location"],
+      "recommended": ["endDate", "image", "description", "offers"]
+    },
+    "LocalBusiness": {
+      "required": ["name", "address", "telephone"],
+      "recommended": ["openingHours", "geo", "url", "image"]
+    }
+  }
+}

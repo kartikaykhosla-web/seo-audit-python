@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Reports / outputs
+report.html
+
+# Large schemaorg data (auto-downloadable)
+schemaorg-current-https.jsonld
+
+# OS
+.DS_Store
+
+# Node artifacts (if any)
+node_modules/
+package-lock.json
