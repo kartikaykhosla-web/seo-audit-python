@@ -116,12 +116,15 @@ div[data-testid="stForm"] {
   padding: 18px 22px;
   box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
   margin-bottom: 18px;
+  overflow: visible;
 }
 .header-title {
   font-family: 'Libre Franklin', sans-serif;
   font-size: 24px;
   font-weight: 600;
   color: #0f172a;
+  line-height: 1.25;
+  padding-top: 2px;
 }
 .header-sub {
   font-size: 13px;
@@ -286,6 +289,8 @@ button[data-testid="baseButton-primary"] * {
   background: #111827 !important;
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
+  filter: none !important;
+  box-shadow: none !important;
 }
 .stButton>button:active,
 .stButton>button:focus,
@@ -294,6 +299,7 @@ button[data-testid="baseButton-primary"] * {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
   box-shadow: none !important;
+  filter: none !important;
 }
 .stButton>button:disabled,
 .stButton>button[disabled] {
@@ -301,12 +307,14 @@ button[data-testid="baseButton-primary"] * {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
   cursor: not-allowed !important;
+  filter: none !important;
 }
 .stButton>button:disabled:hover,
 .stButton>button[disabled]:hover {
   background: #9ca3af !important;
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
+  filter: none !important;
 }
 .stExpander {
   background: #f8fafc;
@@ -452,7 +460,7 @@ if run_button:
         )
         validator.render_report(report, output_path)
 
-    st.success(f"Report generated: {output_path}")
+    # Report is saved locally; suppress banner to keep UI clean.
     if use_schemaorg and not schemaorg_ref:
         st.warning(
             "Schema.org properties reference not loaded. "
