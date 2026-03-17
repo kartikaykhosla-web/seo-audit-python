@@ -84,7 +84,7 @@ html, body, [class*="css"] {
   background: #f3f4f6;
 }
 .block-container {
-  padding-top: 1.25rem;
+  padding-top: 2.5rem;
   max-width: 1180px;
 }
 .stVerticalBlock {
@@ -117,6 +117,7 @@ div[data-testid="stForm"] {
   box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
   margin-bottom: 18px;
   overflow: visible;
+  margin-top: 6px;
 }
 .header-title {
   font-family: 'Libre Franklin', sans-serif;
@@ -386,7 +387,7 @@ with st.form("run_form"):
             unsafe_allow_html=True,
         )
         targets_text = st.text_area(
-            "",
+            "Targets",
             value="",
             help="Enter one per line (domain, sitemap XML, or full page URL).",
             placeholder="jagran.com\nhttps://www.thedailyjagran.com/news-sitemap.xml\nhttps://www.thedailyjagran.com/world/example-article",
@@ -401,7 +402,7 @@ with st.form("run_form"):
         st.markdown('<div class="section-title">Run Settings</div>', unsafe_allow_html=True)
         st.markdown('<div class="field-label">Max URLs per site</div>', unsafe_allow_html=True)
         max_urls = st.number_input(
-            "",
+            "Max URLs per site",
             min_value=1,
             max_value=500,
             value=validator.DEFAULT_MAX_URLS,
