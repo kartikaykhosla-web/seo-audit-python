@@ -49,8 +49,41 @@ TITLE_LENGTH_MIN = 30
 TITLE_LENGTH_MAX = 60
 DESCRIPTION_LENGTH_MIN = 120
 DESCRIPTION_LENGTH_MAX = 160
+WORD_COUNT_WARNING_THRESHOLD = 150
 SITEMAP_STALE_DAYS = 365
 VALID_CHANGEFREQ = {"always", "hourly", "daily", "weekly", "monthly", "yearly", "never"}
+CONTENT_ROOT_SELECTORS = [
+    "article",
+    "main article",
+    "[itemprop='articleBody']",
+    "[itemprop='mainContentOfPage']",
+    ".article-body",
+    ".articleBody",
+    ".story-body",
+    ".storyBody",
+    ".entry-content",
+    ".post-content",
+    ".content-body",
+    ".article-content",
+    "main",
+]
+IMAGE_SOURCE_ATTRS = (
+    "src",
+    "data-src",
+    "data-lazy-src",
+    "data-original",
+    "data-image",
+    "data-fallback-src",
+)
+GENERIC_ALT_VALUES = {
+    "image",
+    "photo",
+    "featured image",
+    "feature image",
+    "thumbnail",
+    "hero image",
+    "img",
+}
 SCHEMA_SUMMARY_FIELDS = [
     "name",
     "headline",
@@ -193,6 +226,15 @@ class UrlCheckResult:
     seo_meta: Dict[str, str] = field(default_factory=dict)
     seo_issues: List[str] = field(default_factory=list)
     seo_warnings: List[str] = field(default_factory=list)
+    word_count: int = 0
+    word_count_source: str = ""
+    heading_h1_count: int = 0
+    heading_h2_count: int = 0
+    heading_h3_count: int = 0
+    heading_structure: List[str] = field(default_factory=list)
+    feature_image_url: str = ""
+    feature_image_alt: str = ""
+    feature_image_status: str = ""
 
 
 @dataclass
@@ -593,6 +635,22 @@ def flatten_jsonld(data) -> List[dict]:
 
     add(data)
     return items
+
+
+def parse_jsonld_block(raw: str) -> Tuple[Optional[object], Optional[str], bool]:
+    if not raw:
+        return None, "Empty JSON-LD block", False
+    try:
+        return json.loads(raw), None, False
+    except Exception as exc:
+        first_error = str(exc)
+
+    sanitized = re.sub(r"[\x00-\x1F]+", " ", raw)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    try:
+        return json.loads(sanitized), None, True
+    except Exception:
+        return None, first_error, False
 
 
 def context_has_schema_org(context) -> bool:
@@ -1200,6 +1258,296 @@ def extract_seo_meta(soup: BeautifulSoup, page_url: str) -> Tuple[Dict[str, str]
     return meta, issues, warnings
 
 
+def normalize_text_content(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def count_words(value: str) -> int:
+    if not value:
+        return 0
+    return len(re.findall(r"\b[\w'-]+\b", value, flags=re.UNICODE))
+
+
+def normalize_heading_text(value: str) -> str:
+    normalized = normalize_text_content(value)
+    normalized = re.sub(r"[^\w\s]", "", normalized, flags=re.UNICODE)
+    return normalized.casefold()
+
+
+def select_content_root(soup: BeautifulSoup) -> Optional[Tag]:
+    candidates: List[Tuple[int, Tag]] = []
+    seen_ids = set()
+    for selector in CONTENT_ROOT_SELECTORS:
+        for node in soup.select(selector):
+            if not isinstance(node, Tag):
+                continue
+            node_id = id(node)
+            if node_id in seen_ids:
+                continue
+            seen_ids.add(node_id)
+            score = count_words(normalize_text_content(node.get_text(" ", strip=True)))
+            if score:
+                candidates.append((score, node))
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+    return soup.body if isinstance(soup.body, Tag) else None
+
+
+def extract_schema_page_signals(html_text: str) -> Tuple[str, str, bool]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    scripts = soup.find_all("script", attrs={"type": re.compile("ld\\+json", re.I)})
+    best_headline = ""
+    best_article_body = ""
+    best_priority = -1
+    is_live_blog = False
+
+    for script in scripts:
+        raw = script.string if script.string is not None else script.get_text()
+        if not raw:
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        data, error, _ = parse_jsonld_block(raw)
+        if data is None:
+            continue
+
+        for obj in flatten_jsonld(data):
+            if not isinstance(obj, dict):
+                continue
+            types = [normalize_schema_type(t) for t in extract_types(obj)]
+            types = [t for t in types if t]
+            if not types:
+                continue
+            if "LiveBlogPosting" in types:
+                is_live_blog = True
+            if not any(t in ("NewsArticle", "Article", "BlogPosting") for t in types):
+                continue
+
+            article_body = normalize_text_content(stringify_node(obj.get("articleBody")))
+            headline = normalize_text_content(
+                stringify_node(obj.get("headline") or obj.get("name"))
+            )
+            priority = 2 if "NewsArticle" in types else 1
+            candidate_size = len(article_body)
+            best_size = len(best_article_body)
+            if priority > best_priority or (priority == best_priority and candidate_size > best_size):
+                best_priority = priority
+                best_article_body = article_body
+                best_headline = headline
+
+    return best_article_body, best_headline, is_live_blog
+
+
+def extract_word_count(
+    soup: BeautifulSoup,
+    content_root: Optional[Tag],
+    schema_article_body: str,
+    is_live_blog: bool,
+) -> Tuple[int, str]:
+    if schema_article_body:
+        return count_words(schema_article_body), "schema articleBody"
+    scope = content_root if content_root is not None else soup
+    text = normalize_text_content(scope.get_text(" ", strip=True))
+    if is_live_blog:
+        return count_words(text), "html content (live blog fallback)"
+    return count_words(text), "html content"
+
+
+def collect_heading_nodes(
+    soup: BeautifulSoup, content_root: Optional[Tag], schema_headline: str
+) -> List[Tag]:
+    scope = content_root if content_root is not None else soup
+    headings = [node for node in scope.find_all(["h1", "h2", "h3"]) if isinstance(node, Tag)]
+    if not headings and scope is not soup:
+        headings = [node for node in soup.find_all(["h1", "h2", "h3"]) if isinstance(node, Tag)]
+
+    if any(node.name.lower() == "h1" for node in headings):
+        return headings
+
+    global_h1s = [node for node in soup.find_all("h1") if isinstance(node, Tag)]
+    if not global_h1s:
+        return headings
+
+    preferred_h1: Optional[Tag] = None
+    if schema_headline:
+        schema_key = normalize_heading_text(schema_headline)
+        for node in global_h1s:
+            if normalize_heading_text(node.get_text(" ", strip=True)) == schema_key:
+                preferred_h1 = node
+                break
+    if preferred_h1 is None and len(global_h1s) == 1:
+        preferred_h1 = global_h1s[0]
+
+    if preferred_h1 is None:
+        return headings
+
+    merged = [preferred_h1]
+    seen = {id(preferred_h1)}
+    for node in headings:
+        node_id = id(node)
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        merged.append(node)
+    return merged
+
+
+def extract_heading_audit(
+    soup: BeautifulSoup, content_root: Optional[Tag], schema_headline: str
+) -> Tuple[int, int, int, List[str], List[str]]:
+    headings = collect_heading_nodes(soup, content_root, schema_headline)
+
+    counts = {"h1": 0, "h2": 0, "h3": 0}
+    structure: List[str] = []
+    issues: List[str] = []
+    seen_issues = set()
+    previous_level = 0
+    empty_headings = 0
+
+    for heading in headings:
+        level = heading.name.lower()
+        if level not in counts:
+            continue
+        counts[level] += 1
+        heading_text = normalize_text_content(heading.get_text(" ", strip=True))
+        if heading_text:
+            structure.append(f"{level.upper()}: {truncate(heading_text, 140)}")
+        else:
+            empty_headings += 1
+
+        level_number = int(level[1])
+        if previous_level and level_number > previous_level + 1:
+            issue = f"On-page: Heading hierarchy skips from H{previous_level} to H{level_number}"
+            if issue not in seen_issues:
+                issues.append(issue)
+                seen_issues.add(issue)
+        if heading_text:
+            previous_level = level_number
+
+    total_headings = sum(counts.values())
+    if total_headings == 0:
+        issues.append("On-page: No H1/H2/H3 headings found")
+    elif counts["h1"] == 0:
+        issues.append("On-page: Missing H1")
+    elif counts["h1"] > 1:
+        issues.append(f"On-page: Multiple H1 tags ({counts['h1']})")
+
+    if empty_headings:
+        issues.append(f"On-page: Empty heading tags ({empty_headings})")
+
+    return counts["h1"], counts["h2"], counts["h3"], structure, issues
+
+
+def extract_image_src(image: Tag, page_url: str) -> str:
+    for attr in IMAGE_SOURCE_ATTRS:
+        raw = image.get(attr)
+        if raw and isinstance(raw, str):
+            raw = raw.strip()
+            if raw and not raw.startswith("data:"):
+                return urljoin(page_url, raw)
+
+    srcset = image.get("srcset") or image.get("data-srcset")
+    if srcset and isinstance(srcset, str):
+        first = srcset.split(",", 1)[0].strip().split(" ", 1)[0]
+        if first and not first.startswith("data:"):
+            return urljoin(page_url, first)
+    return ""
+
+
+def image_basename(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        path = urlparse(value).path
+    except Exception:
+        path = value
+    return os.path.basename(path).lower()
+
+
+def normalize_image_url(value: str, page_url: str) -> str:
+    if not value:
+        return ""
+    return urljoin(page_url, value.strip())
+
+
+def classify_feature_image_alt(alt_text: str) -> str:
+    normalized = normalize_text_content(alt_text).lower()
+    if not normalized:
+        return "Missing"
+    if normalized in GENERIC_ALT_VALUES or len(normalized) < 5:
+        return "Weak"
+    return "Pass"
+
+
+def extract_feature_image_audit(
+    soup: BeautifulSoup,
+    page_url: str,
+    seo_meta: Dict[str, str],
+    schema_objects: List[Dict[str, str]],
+    content_root: Optional[Tag],
+) -> Tuple[str, str, str]:
+    candidate_urls: List[str] = []
+    for value in (seo_meta.get("og:image", ""), seo_meta.get("twitter:image", "")):
+        if value:
+            candidate_urls.append(normalize_image_url(value, page_url))
+
+    for obj in schema_objects:
+        image_value = obj.get("image", "")
+        if image_value:
+            candidate_urls.append(normalize_image_url(image_value, page_url))
+
+    deduped_candidates: List[str] = []
+    seen_candidates = set()
+    for value in candidate_urls:
+        if not value:
+            continue
+        key = normalize_url_for_compare(value)
+        if key in seen_candidates:
+            continue
+        seen_candidates.add(key)
+        deduped_candidates.append(value)
+
+    dom_scope = content_root if content_root is not None else soup
+    dom_images = dom_scope.find_all("img")
+    if not dom_images and dom_scope is not soup:
+        dom_images = soup.find_all("img")
+
+    matched_image: Optional[Tag] = None
+    matched_src = ""
+    candidate_keys = [normalize_url_for_compare(value) for value in deduped_candidates if value]
+    candidate_basenames = {image_basename(value) for value in deduped_candidates if value}
+
+    for image in dom_images:
+        image_src = extract_image_src(image, page_url)
+        if not image_src:
+            continue
+        image_key = normalize_url_for_compare(image_src)
+        base_name = image_basename(image_src)
+        if image_key in candidate_keys or (base_name and base_name in candidate_basenames):
+            matched_image = image
+            matched_src = image_src
+            break
+
+    if matched_image is None and dom_images:
+        for image in dom_images:
+            image_src = extract_image_src(image, page_url)
+            if image_src:
+                matched_image = image
+                matched_src = image_src
+                break
+
+    if matched_image is not None:
+        alt_text = normalize_text_content(str(matched_image.get("alt", "")))
+        return matched_src, alt_text, classify_feature_image_alt(alt_text)
+
+    if deduped_candidates:
+        return deduped_candidates[0], "", "Not found in HTML"
+
+    return "", "", "Not found"
+
+
 def extract_author_info(value, id_map: Optional[Dict[str, dict]] = None) -> Tuple[List[str], bool]:
     names: List[str] = []
     has_typed = False
@@ -1529,11 +1877,12 @@ def extract_schemas(
         raw = raw.strip()
         if not raw:
             continue
-        try:
-            data = json.loads(raw)
-        except Exception as exc:
-            issues.append(f"Invalid JSON-LD block: {exc}")
+        data, error, sanitized = parse_jsonld_block(raw)
+        if data is None:
+            issues.append(f"Invalid JSON-LD block: {error}")
             continue
+        if sanitized:
+            warnings.append("JSON-LD block sanitized before parsing")
         jsonld_blocks += 1
         root_context = data.get("@context") if isinstance(data, dict) else None
         if isinstance(data, dict) and "@context" not in data:
@@ -1786,6 +2135,27 @@ def check_url(
 
     soup = BeautifulSoup(resp.text, "html.parser")
     seo_meta, seo_issues, seo_warnings = extract_seo_meta(soup, url)
+    schema_article_body, schema_headline, is_live_blog = extract_schema_page_signals(
+        resp.text
+    )
+    content_root = select_content_root(soup)
+    word_count, word_count_source = extract_word_count(
+        soup, content_root, schema_article_body, is_live_blog
+    )
+    (
+        heading_h1_count,
+        heading_h2_count,
+        heading_h3_count,
+        heading_structure,
+        heading_issues,
+    ) = extract_heading_audit(soup, content_root, schema_headline)
+    feature_image_url, feature_image_alt, feature_image_status = extract_feature_image_audit(
+        soup,
+        url,
+        seo_meta,
+        schema_objects,
+        content_root,
+    )
     robots_meta, meta_directives = extract_robots_meta(soup)
     x_robots_tag = resp.headers.get("X-Robots-Tag", "")
     x_directives = parse_directives(x_robots_tag)
@@ -1815,6 +2185,25 @@ def check_url(
         warnings.append("Hreflang issues: " + "; ".join(hreflang_issues[:3]))
     if auth_blocked:
         warnings.append(f"Access block suspected: {auth_blocked}")
+    if word_count == 0:
+        no_copy_issue = "On-page: No meaningful body copy detected"
+        warnings.append(no_copy_issue)
+        seo_warnings.append(no_copy_issue)
+    elif word_count < WORD_COUNT_WARNING_THRESHOLD:
+        low_word_count = f"On-page: Low word count ({word_count} words)"
+        warnings.append(low_word_count)
+        seo_warnings.append(low_word_count)
+    for heading_issue in heading_issues:
+        warnings.append(heading_issue)
+        seo_warnings.append(heading_issue)
+    if feature_image_status == "Missing":
+        alt_issue = "On-page: Feature image missing alt text"
+        warnings.append(alt_issue)
+        seo_warnings.append(alt_issue)
+    elif feature_image_status == "Weak":
+        alt_issue = "On-page: Feature image alt text is weak"
+        warnings.append(alt_issue)
+        seo_warnings.append(alt_issue)
 
     return UrlCheckResult(
         url=url,
@@ -1845,6 +2234,15 @@ def check_url(
         seo_meta=seo_meta,
         seo_issues=seo_issues,
         seo_warnings=seo_warnings,
+        word_count=word_count,
+        word_count_source=word_count_source,
+        heading_h1_count=heading_h1_count,
+        heading_h2_count=heading_h2_count,
+        heading_h3_count=heading_h3_count,
+        heading_structure=heading_structure,
+        feature_image_url=feature_image_url,
+        feature_image_alt=feature_image_alt,
+        feature_image_status=feature_image_status,
     )
 
 
@@ -2188,6 +2586,24 @@ def issue_to_fix(issue: str) -> str:
         return f"Expand the meta description to {DESCRIPTION_LENGTH_MIN}-{DESCRIPTION_LENGTH_MAX} characters."
     if issue.startswith("SEO: Meta description too long"):
         return f"Shorten the meta description to {DESCRIPTION_LENGTH_MIN}-{DESCRIPTION_LENGTH_MAX} characters."
+    if issue.startswith("On-page: Feature image missing alt text"):
+        return "Add descriptive alt text to the feature image."
+    if issue.startswith("On-page: Feature image alt text is weak"):
+        return "Improve the feature image alt text so it describes the image clearly."
+    if issue.startswith("On-page: Low word count"):
+        return "Expand thin copy or confirm the page is intentionally short."
+    if issue.startswith("On-page: No meaningful body copy detected"):
+        return "Ensure the primary page body content is present in the HTML response."
+    if issue.startswith("On-page: Missing H1"):
+        return "Add one clear H1 that matches the page topic."
+    if issue.startswith("On-page: Multiple H1"):
+        return "Use a single primary H1 and demote extra headings."
+    if issue.startswith("On-page: No H1/H2/H3 headings found"):
+        return "Add a clear heading structure using H1, H2, and H3 where needed."
+    if issue.startswith("On-page: Heading hierarchy skips"):
+        return "Fix heading hierarchy so levels do not skip."
+    if issue.startswith("On-page: Empty heading tags"):
+        return "Remove empty headings or add meaningful heading text."
     if issue.startswith("HTTP "):
         return f"Resolve page errors ({issue})."
     if issue.startswith("Fetch error"):
@@ -2252,7 +2668,7 @@ def compute_executive_summary(report: Report) -> Dict[str, object]:
             schema_warning_count = max(len(result.warnings) - len(result.seo_warnings), 0)
             total_schema_issues += schema_issue_count
             total_schema_warnings += schema_warning_count
-            for issue in result.issues:
+            for issue in result.issues + result.warnings:
                 fix = issue_to_fix(issue)
                 schema_fix_counter[fix] = schema_fix_counter.get(fix, 0) + 1
 
@@ -2367,6 +2783,36 @@ def compute_executive_summary(report: Report) -> Dict[str, object]:
 def render_report(report: Report, output_path: str) -> None:
     def esc(value: str) -> str:
         return html.escape(value)
+
+    def content_summary(result: UrlCheckResult) -> str:
+        if result.fetch_error or result.http_status is None:
+            return "Not checked"
+        if result.http_status >= 400:
+            return "Not checked"
+        if result.content_type and "text/html" not in result.content_type.lower():
+            return "Not checked"
+        parts: List[str] = []
+        if result.word_count:
+            if result.word_count_source:
+                parts.append(f"{result.word_count} words ({result.word_count_source})")
+            else:
+                parts.append(f"{result.word_count} words")
+        if result.heading_h1_count or result.heading_h2_count or result.heading_h3_count:
+            parts.append(
+                f"H1:{result.heading_h1_count} H2:{result.heading_h2_count} H3:{result.heading_h3_count}"
+            )
+        else:
+            parts.append("No H1/H2/H3")
+        if result.feature_image_status:
+            parts.append(f"Alt: {result.feature_image_status}")
+        return " | ".join(parts)
+
+    def is_heading_warning(message: str) -> bool:
+        return message.startswith("On-page: Missing H1") or message.startswith(
+            "On-page: Multiple H1"
+        ) or message.startswith("On-page: Heading hierarchy skips") or message.startswith(
+            "On-page: Empty heading"
+        ) or message.startswith("On-page: No H1/H2/H3 headings found")
 
     total_urls = sum(len(site.urls) for site in report.sites)
     total_sitemaps = sum(len(site.sitemaps) for site in report.sites)
@@ -2586,7 +3032,7 @@ def render_report(report: Report, output_path: str) -> None:
         else:
             lines.append("<table>")
             lines.append(
-                "<tr><th>URL</th><th>HTTP</th><th>Indexability</th><th>JSON-LD</th><th>Microdata</th><th>RDFa</th><th>JSON-LD Objects</th><th>Microdata Objects</th><th>RDFa Objects</th><th>Issues</th><th>Warnings</th></tr>"
+                "<tr><th>URL</th><th>HTTP</th><th>Indexability</th><th>Content</th><th>JSON-LD</th><th>Microdata</th><th>RDFa</th><th>JSON-LD Objects</th><th>Microdata Objects</th><th>RDFa Objects</th><th>Issues</th><th>Warnings</th></tr>"
             )
             for result in site.urls:
                 http_status = result.http_status if result.http_status is not None else "-"
@@ -2617,6 +3063,7 @@ def render_report(report: Report, output_path: str) -> None:
                     f"<td>{esc(result.url)}</td>"
                     f"<td><span class='badge {badge}'>{http_status}</span></td>"
                     f"<td>{esc(result.indexability_status or '-')}</td>"
+                    f"<td>{esc(content_summary(result))}</td>"
                     f"<td>{jsonld_summary}</td>"
                     f"<td>{result.microdata_items}</td>"
                     f"<td>{result.rdfa_elements}</td>"
@@ -2811,6 +3258,98 @@ def render_report(report: Report, output_path: str) -> None:
                         dup_detail = "No duplicate canonical targets"
                 lines.append(crawl_row("Duplicate canonicals", dup_status, dup_detail))
 
+                lines.append("</table>")
+
+                lines.append("<div><strong>Content Checks</strong></div>")
+                lines.append("<table>")
+                lines.append("<tr><th>Check</th><th>Status</th><th>Details</th></tr>")
+                if not has_response or not is_html:
+                    lines.append(
+                        crawl_row("Word count", "Not checked", "Page not fetched as HTML")
+                    )
+                    lines.append(
+                        crawl_row(
+                            "Feature image alt text",
+                            "Not checked",
+                            "Page not fetched as HTML",
+                        )
+                    )
+                    lines.append(
+                        crawl_row(
+                            "Heading counts",
+                            "Not checked",
+                            "Page not fetched as HTML",
+                        )
+                    )
+                    lines.append(
+                        crawl_row(
+                            "Heading structure",
+                            "Not checked",
+                            "Page not fetched as HTML",
+                        )
+                    )
+                else:
+                    if result.word_count == 0:
+                        word_status = "Review"
+                    elif result.word_count < WORD_COUNT_WARNING_THRESHOLD:
+                        word_status = "Low"
+                    else:
+                        word_status = "Pass"
+                    word_detail = (
+                        (
+                            f"{result.word_count} words ({result.word_count_source})"
+                            if result.word_count_source
+                            else f"{result.word_count} words"
+                        )
+                        if result.word_count
+                        else "No meaningful article copy detected"
+                    )
+                    lines.append(crawl_row("Word count", word_status, word_detail))
+
+                    feature_status = result.feature_image_status or "Not found"
+                    if result.feature_image_url:
+                        feature_detail_parts = [result.feature_image_url]
+                    else:
+                        feature_detail_parts = []
+                    if result.feature_image_alt:
+                        feature_detail_parts.append(f"alt: {result.feature_image_alt}")
+                    elif feature_status == "Missing":
+                        feature_detail_parts.append("alt: missing")
+                    elif feature_status == "Weak":
+                        feature_detail_parts.append("alt: weak/generic")
+                    elif feature_status == "Not found in HTML":
+                        feature_detail_parts.append(
+                            "Feature image found via meta/schema but not matched in page HTML"
+                        )
+                    elif feature_status == "Not found":
+                        feature_detail_parts.append("No feature image detected")
+                    lines.append(
+                        crawl_row(
+                            "Feature image alt text",
+                            feature_status,
+                            " | ".join(feature_detail_parts),
+                        )
+                    )
+
+                    heading_counts = (
+                        f"H1: {result.heading_h1_count} | "
+                        f"H2: {result.heading_h2_count} | "
+                        f"H3: {result.heading_h3_count}"
+                    )
+                    heading_status = "Pass"
+                    if any(is_heading_warning(item) for item in result.warnings):
+                        heading_status = "Review"
+                    lines.append(crawl_row("Heading counts", heading_status, heading_counts))
+
+                    if result.heading_structure:
+                        structure_html = "<ul class='kv-list'>" + "".join(
+                            f"<li>{esc(item)}</li>" for item in result.heading_structure
+                        ) + "</ul>"
+                    else:
+                        structure_html = "No heading structure detected"
+                    lines.append(
+                        f"<tr><th>Heading structure</th><td>{esc(heading_status)}</td><td>{structure_html}</td></tr>"
+                    )
                 lines.append("</table>")
 
                 if result.seo_meta:
