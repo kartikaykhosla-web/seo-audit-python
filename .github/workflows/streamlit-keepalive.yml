@@ -12,9 +12,30 @@ jobs:
       - name: Ping Streamlit app
         run: |
           set -euo pipefail
-          curl --fail --silent --show-error --location \
-            --retry 3 \
-            --retry-delay 5 \
-            --max-time 60 \
-            "https://seo-audit-python.streamlit.app/?keepalive=$(date +%s)" \
-            > /dev/null
+          APP_URL="https://seo-audit-python.streamlit.app"
+          USER_AGENT="Mozilla/5.0 (compatible; GitHubActionsKeepAlive/1.0)"
+
+          for endpoint in \
+            "${APP_URL}/_stcore/health" \
+            "${APP_URL}/healthz" \
+            "${APP_URL}/"; do
+            code="$(curl --silent --show-error \
+              --output /tmp/keepalive-response.txt \
+              --write-out "%{http_code}" \
+              --retry 3 \
+              --retry-delay 5 \
+              --max-time 60 \
+              --user-agent "${USER_AGENT}" \
+              "${endpoint}")"
+
+            echo "Endpoint: ${endpoint}"
+            echo "HTTP: ${code}"
+
+            if [ "${code}" -ge 200 ] && [ "${code}" -lt 400 ]; then
+              exit 0
+            fi
+          done
+
+          echo "Keepalive failed for all endpoints."
+          cat /tmp/keepalive-response.txt || true
+          exit 1
