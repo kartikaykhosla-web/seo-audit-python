@@ -44,7 +44,22 @@ DEFAULT_SCHEMAORG_REF_PATH = os.path.join(
 DEFAULT_SCHEMAORG_DATA_PATH = os.path.join(
     os.path.dirname(__file__), "schemaorg-current-https.jsonld"
 )
+DEFAULT_GSC_JSON_PATH = "/Users/kartikaykhosla/Documents/article-analyzer/bscadmanager-227c5bb67c18.json"
+DEFAULT_GSC_CACHE_PATH = "/Users/kartikaykhosla/Documents/article-analyzer/gsc_inspection_cache.json"
+DEFAULT_GSC_CACHE_TTL_HOURS = 24
 SCHEMAORG_DATA_URL = "https://schema.org/version/latest/schemaorg-current-https.jsonld"
+DEFAULT_GSC_PROPERTY_MAP = {
+    "jagran.com": "https://www.jagran.com/",
+    "www.jagran.com": "https://www.jagran.com/",
+    "jagranjosh.com": "https://www.jagranjosh.com/",
+    "www.jagranjosh.com": "https://www.jagranjosh.com/",
+    "onlymyhealth.com": "https://www.onlymyhealth.com/",
+    "www.onlymyhealth.com": "https://www.onlymyhealth.com/",
+    "thedailyjagran.com": "https://www.thedailyjagran.com/",
+    "www.thedailyjagran.com": "https://www.thedailyjagran.com/",
+    "herzindagi.com": "https://www.herzindagi.com/",
+    "www.herzindagi.com": "https://www.herzindagi.com/",
+}
 TITLE_LENGTH_MIN = 30
 TITLE_LENGTH_MAX = 60
 DESCRIPTION_LENGTH_MIN = 120
@@ -235,6 +250,20 @@ class UrlCheckResult:
     feature_image_url: str = ""
     feature_image_alt: str = ""
     feature_image_status: str = ""
+    gsc_property: str = ""
+    gsc_status: str = ""
+    gsc_verdict: str = ""
+    gsc_coverage_state: str = ""
+    gsc_indexing_state: str = ""
+    gsc_robots_state: str = ""
+    gsc_page_fetch_state: str = ""
+    gsc_last_crawl_time: str = ""
+    gsc_google_canonical: str = ""
+    gsc_user_canonical: str = ""
+    gsc_sitemaps: List[str] = field(default_factory=list)
+    gsc_referring_urls: List[str] = field(default_factory=list)
+    gsc_error: str = ""
+    gsc_checked_at: str = ""
 
 
 @dataclass
@@ -257,6 +286,9 @@ class Report:
     schemaorg_ref_path: str
     schemaorg_ref_loaded: bool
     schemaorg_types: int
+    gsc_enabled: bool
+    gsc_json_path: str
+    gsc_cache_path: str
     sites: List[SiteReport]
 
 
@@ -467,6 +499,197 @@ def group_by_domain(urls: List[str]) -> Dict[str, List[str]]:
             continue
         grouped.setdefault(domain, []).append(url)
     return grouped
+
+
+def normalize_gsc_domain(domain: str) -> str:
+    domain = (domain or "").strip().lower()
+    if domain.startswith("www."):
+        return domain[4:]
+    return domain
+
+
+def infer_gsc_property(url: str, candidate_domains: List[str]) -> str:
+    host = extract_domain(url) or ""
+    raw_host = (host or "").strip().lower()
+    host = normalize_gsc_domain(raw_host)
+    if not raw_host:
+        return ""
+    if raw_host in DEFAULT_GSC_PROPERTY_MAP:
+        return DEFAULT_GSC_PROPERTY_MAP[raw_host]
+    if host in DEFAULT_GSC_PROPERTY_MAP:
+        return DEFAULT_GSC_PROPERTY_MAP[host]
+
+    candidates = sorted({normalize_gsc_domain(domain) for domain in candidate_domains if domain}, key=len, reverse=True)
+    for domain in candidates:
+        if host == domain or host.endswith("." + domain):
+            mapped = DEFAULT_GSC_PROPERTY_MAP.get(domain)
+            if mapped:
+                return mapped
+
+    return ""
+
+
+def build_gsc_service(json_path: str):
+    if not json_path:
+        return None, "GSC JSON path not provided"
+    if not os.path.exists(json_path):
+        return None, f"GSC JSON not found: {json_path}"
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+    except Exception as exc:
+        return None, f"GSC libraries not available: {exc}"
+
+    try:
+        credentials = service_account.Credentials.from_service_account_file(
+            json_path,
+            scopes=["https://www.googleapis.com/auth/webmasters.readonly"],
+        )
+        service = build("searchconsole", "v1", credentials=credentials, cache_discovery=False)
+        return service, None
+    except Exception as exc:
+        return None, f"GSC auth failed: {exc}"
+
+
+def load_gsc_cache(cache_path: str) -> Dict[str, Dict[str, object]]:
+    if not cache_path or not os.path.exists(cache_path):
+        return {}
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): v for k, v in data.items() if isinstance(v, dict)}
+    except Exception:
+        return {}
+    return {}
+
+
+def save_gsc_cache(cache_path: str, cache: Dict[str, Dict[str, object]]) -> None:
+    if not cache_path:
+        return
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def gsc_cache_key(site_property: str, inspection_url: str) -> str:
+    return f"{site_property}::{normalize_url_for_compare(inspection_url)}"
+
+
+def parse_datetime_safe(value: str) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        raw = value
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def get_cached_gsc_result(
+    cache: Dict[str, Dict[str, object]],
+    site_property: str,
+    inspection_url: str,
+    ttl_hours: int,
+) -> Optional[Dict[str, object]]:
+    key = gsc_cache_key(site_property, inspection_url)
+    item = cache.get(key)
+    if not item:
+        return None
+    checked_at = parse_datetime_safe(str(item.get("checked_at", "") or ""))
+    if not checked_at:
+        return None
+    age = dt.datetime.now(dt.timezone.utc) - checked_at
+    if age.total_seconds() > ttl_hours * 3600:
+        return None
+    return dict(item)
+
+
+def set_cached_gsc_result(
+    cache: Dict[str, Dict[str, object]],
+    site_property: str,
+    inspection_url: str,
+    result: Dict[str, object],
+) -> None:
+    key = gsc_cache_key(site_property, inspection_url)
+    cache[key] = dict(result)
+
+
+def normalize_gsc_index_result(index_status: Dict[str, object]) -> Dict[str, object]:
+    verdict = str(index_status.get("verdict", "") or "")
+    coverage = str(index_status.get("coverageState", "") or "")
+    indexing = str(index_status.get("indexingState", "") or "")
+    robots = str(index_status.get("robotsTxtState", "") or "")
+    fetch = str(index_status.get("pageFetchState", "") or "")
+
+    status = "Unknown"
+    if robots == "DISALLOWED" or fetch == "BLOCKED_ROBOTS_TXT":
+        status = "Blocked by robots.txt"
+    elif indexing in ("BLOCKED_BY_META_TAG", "BLOCKED_BY_HTTP_HEADER"):
+        status = "Blocked by noindex"
+    elif verdict == "PASS":
+        status = "Indexed"
+    elif verdict == "NEUTRAL":
+        status = "Excluded"
+    elif verdict == "FAIL":
+        status = "Error"
+
+    return {
+        "status": status,
+        "verdict": verdict,
+        "coverage_state": coverage,
+        "indexing_state": indexing,
+        "robots_state": robots,
+        "page_fetch_state": fetch,
+        "last_crawl_time": str(index_status.get("lastCrawlTime", "") or ""),
+        "google_canonical": str(index_status.get("googleCanonical", "") or ""),
+        "user_canonical": str(index_status.get("userCanonical", "") or ""),
+        "sitemaps": list(index_status.get("sitemap", []) or []),
+        "referring_urls": list(index_status.get("referringUrls", []) or []),
+        "error": "",
+    }
+
+
+def inspect_url_in_gsc(service, inspection_url: str, site_property: str) -> Dict[str, object]:
+    if service is None:
+        return {"status": "", "error": "GSC service unavailable"}
+    try:
+        body = {
+            "inspectionUrl": inspection_url,
+            "siteUrl": site_property,
+            "languageCode": "en-US",
+        }
+        response = service.urlInspection().index().inspect(body=body).execute()
+        inspection_result = response.get("inspectionResult", {})
+        index_status = inspection_result.get("indexStatusResult", {})
+        if not isinstance(index_status, dict):
+            return {"status": "", "error": "GSC returned no index status result"}
+        normalized = normalize_gsc_index_result(index_status)
+        normalized["property"] = site_property
+        normalized["checked_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        return normalized
+    except Exception as exc:
+        return {
+            "status": "",
+            "property": site_property,
+            "error": str(exc),
+            "verdict": "",
+            "coverage_state": "",
+            "indexing_state": "",
+            "robots_state": "",
+            "page_fetch_state": "",
+            "last_crawl_time": "",
+            "google_canonical": "",
+            "user_canonical": "",
+            "sitemaps": [],
+            "referring_urls": [],
+            "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
 
 
 def fetch_url(session: requests.Session, url: str, user_agent: str, timeout: int = 20) -> Tuple[Optional[requests.Response], Optional[str]]:
@@ -2070,6 +2293,10 @@ def check_url(
     user_agent: str,
     rules: Dict[str, dict],
     schemaorg_ref: Optional[Dict[str, List[str]]],
+    gsc_service=None,
+    gsc_candidate_domains: Optional[List[str]] = None,
+    gsc_cache: Optional[Dict[str, Dict[str, object]]] = None,
+    gsc_cache_ttl_hours: int = DEFAULT_GSC_CACHE_TTL_HOURS,
 ) -> UrlCheckResult:
     if not rp.can_fetch(user_agent, url):
         return UrlCheckResult(
@@ -2205,6 +2432,46 @@ def check_url(
         warnings.append(alt_issue)
         seo_warnings.append(alt_issue)
 
+    gsc_result: Dict[str, object] = {}
+    gsc_property = ""
+    if gsc_service is not None:
+        gsc_property = infer_gsc_property(url, gsc_candidate_domains or [])
+        if not gsc_property:
+            gsc_result = {
+                "status": "",
+                "property": "",
+                "error": "No GSC property mapping configured for this domain",
+                "verdict": "",
+                "coverage_state": "",
+                "indexing_state": "",
+                "robots_state": "",
+                "page_fetch_state": "",
+                "last_crawl_time": "",
+                "google_canonical": "",
+                "user_canonical": "",
+                "sitemaps": [],
+                "referring_urls": [],
+                "checked_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+        else:
+            cached = get_cached_gsc_result(
+                gsc_cache or {}, gsc_property, url, gsc_cache_ttl_hours
+            )
+            if cached is not None:
+                gsc_result = cached
+            else:
+                gsc_result = inspect_url_in_gsc(gsc_service, url, gsc_property)
+                if gsc_cache is not None:
+                    set_cached_gsc_result(gsc_cache, gsc_property, url, gsc_result)
+        gsc_error = str(gsc_result.get("error", "") or "")
+        gsc_status = str(gsc_result.get("status", "") or "")
+        if gsc_error:
+            warnings.append(f"GSC: {gsc_error}")
+            seo_warnings.append(f"GSC: {gsc_error}")
+        elif gsc_status and gsc_status != "Indexed":
+            warnings.append(f"GSC: {gsc_status}")
+            seo_warnings.append(f"GSC: {gsc_status}")
+
     return UrlCheckResult(
         url=url,
         http_status=resp.status_code,
@@ -2243,6 +2510,20 @@ def check_url(
         feature_image_url=feature_image_url,
         feature_image_alt=feature_image_alt,
         feature_image_status=feature_image_status,
+        gsc_property=gsc_property or str(gsc_result.get("property", "") or ""),
+        gsc_status=str(gsc_result.get("status", "") or ""),
+        gsc_verdict=str(gsc_result.get("verdict", "") or ""),
+        gsc_coverage_state=str(gsc_result.get("coverage_state", "") or ""),
+        gsc_indexing_state=str(gsc_result.get("indexing_state", "") or ""),
+        gsc_robots_state=str(gsc_result.get("robots_state", "") or ""),
+        gsc_page_fetch_state=str(gsc_result.get("page_fetch_state", "") or ""),
+        gsc_last_crawl_time=str(gsc_result.get("last_crawl_time", "") or ""),
+        gsc_google_canonical=str(gsc_result.get("google_canonical", "") or ""),
+        gsc_user_canonical=str(gsc_result.get("user_canonical", "") or ""),
+        gsc_sitemaps=list(gsc_result.get("sitemaps", []) or []),
+        gsc_referring_urls=list(gsc_result.get("referring_urls", []) or []),
+        gsc_error=str(gsc_result.get("error", "") or ""),
+        gsc_checked_at=str(gsc_result.get("checked_at", "") or ""),
     )
 
 
@@ -2252,6 +2533,10 @@ def gather_site(
     user_agent: str,
     rules: Dict[str, dict],
     schemaorg_ref: Optional[Dict[str, List[str]]],
+    gsc_service=None,
+    gsc_candidate_domains: Optional[List[str]] = None,
+    gsc_cache: Optional[Dict[str, Dict[str, object]]] = None,
+    gsc_cache_ttl_hours: int = DEFAULT_GSC_CACHE_TTL_HOURS,
     sitemap_urls: Optional[List[str]] = None,
     page_urls: Optional[List[str]] = None,
 ) -> SiteReport:
@@ -2455,7 +2740,18 @@ def gather_site(
             urls.append(url)
 
     for url in urls:
-        result = check_url(session, url, rp, user_agent, rules, schemaorg_ref)
+        result = check_url(
+            session,
+            url,
+            rp,
+            user_agent,
+            rules,
+            schemaorg_ref,
+            gsc_service=gsc_service,
+            gsc_candidate_domains=gsc_candidate_domains,
+            gsc_cache=gsc_cache,
+            gsc_cache_ttl_hours=gsc_cache_ttl_hours,
+        )
         site_report.urls.append(result)
 
     return site_report
@@ -2643,6 +2939,12 @@ def compute_executive_summary(report: Report) -> Dict[str, object]:
     non_html_urls = 0
     error_urls = 0
     uncertain_urls = 0
+    gsc_indexed_urls = 0
+    gsc_excluded_urls = 0
+    gsc_blocked_urls = 0
+    gsc_error_urls = 0
+    gsc_last_checked_values: List[dt.datetime] = []
+    gsc_last_crawl_values: List[dt.datetime] = []
 
     for site in report.sites:
         for sm in site.sitemaps:
@@ -2707,6 +3009,33 @@ def compute_executive_summary(report: Report) -> Dict[str, object]:
                 elif status.startswith("Uncertain"):
                     uncertain_urls += 1
 
+            gsc_status = result.gsc_status
+            if gsc_status == "Indexed":
+                gsc_indexed_urls += 1
+            elif gsc_status in ("Blocked by robots.txt", "Blocked by noindex"):
+                gsc_blocked_urls += 1
+            elif gsc_status == "Excluded":
+                gsc_excluded_urls += 1
+            elif gsc_status == "Error" or result.gsc_error:
+                gsc_error_urls += 1
+            checked_at = parse_datetime_safe(result.gsc_checked_at)
+            if checked_at:
+                gsc_last_checked_values.append(checked_at)
+            crawl_at = parse_datetime_safe(result.gsc_last_crawl_time)
+            if crawl_at:
+                gsc_last_crawl_values.append(crawl_at)
+
+    latest_gsc_checked = (
+        max(gsc_last_checked_values).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if gsc_last_checked_values
+        else ""
+    )
+    latest_gsc_crawl = (
+        max(gsc_last_crawl_values).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if gsc_last_crawl_values
+        else ""
+    )
+
     meta_expected = total_urls * len(SEO_COVERAGE_KEYS) if total_urls else 0
     meta_coverage_pct = int(round((meta_present / meta_expected) * 100)) if meta_expected else 0
     meta_missing = meta_expected - meta_present if meta_expected else 0
@@ -2750,6 +3079,7 @@ def compute_executive_summary(report: Report) -> Dict[str, object]:
         f"SEO issues: {total_seo_issues}",
         f"SEO warnings: {total_seo_warnings}",
         f"Meta coverage: {meta_coverage_pct}% (missing {meta_missing})",
+        f"GSC indexing: {gsc_indexed_urls} indexed, {gsc_excluded_urls} excluded, {gsc_blocked_urls} blocked, {gsc_error_urls} errors",
         "Indexability: "
         f"{indexable_urls} indexable, {blocked_urls} blocked, {uncertain_urls} uncertain, "
         f"{redirected_urls} redirected, {canonicalized_urls} canonicalized, "
@@ -2773,6 +3103,12 @@ def compute_executive_summary(report: Report) -> Dict[str, object]:
         "canonicalized_urls": canonicalized_urls,
         "error_urls": error_urls,
         "non_html_urls": non_html_urls,
+        "gsc_indexed_urls": gsc_indexed_urls,
+        "gsc_excluded_urls": gsc_excluded_urls,
+        "gsc_blocked_urls": gsc_blocked_urls,
+        "gsc_error_urls": gsc_error_urls,
+        "gsc_last_checked": latest_gsc_checked,
+        "gsc_last_crawl": latest_gsc_crawl,
         "seo_score": seo_score,
         "seo_grade": seo_grade,
         "schema_score": schema_score,
@@ -2884,6 +3220,8 @@ def render_report(report: Report, output_path: str) -> None:
         f"Max URLs/site: {report.max_urls_per_site} | User-Agent: {esc(report.user_agent)} | "
         f"Rules: {esc(report.rules_path)} | Schema.org ref: {esc(report.schemaorg_ref_path)} | "
         f"Schema.org types: {report.schemaorg_types} | "
+        f"GSC: {'enabled' if report.gsc_enabled else 'disabled'} | "
+        f"GSC cache: {esc(report.gsc_cache_path)} | "
         f"Sitemap stale threshold: {SITEMAP_STALE_DAYS} days</div>"
     )
 
@@ -2931,6 +3269,13 @@ def render_report(report: Report, output_path: str) -> None:
         "<div class='sub'>URLs</div>"
         "</div>"
     )
+    lines.append(
+        "<div class='card'>"
+        "<div class='label'>GSC Indexed</div>"
+        f"<div class='value'>{summary['gsc_indexed_urls']}</div>"
+        f"<div class='sub'>Blocked: {summary['gsc_blocked_urls']} · Excluded: {summary['gsc_excluded_urls']}</div>"
+        "</div>"
+    )
     lines.append("</div>")
     lines.append("<div class='section'>")
     lines.append("<h2>Executive Summary</h2>")
@@ -2944,6 +3289,21 @@ def render_report(report: Report, output_path: str) -> None:
         f"<td>{summary['schema_score']}/100</td><td>{summary['schema_grade']}</td></tr>"
     )
     lines.append("</table>")
+    if report.gsc_enabled:
+        lines.append("<div><strong>GSC Snapshot</strong></div>")
+        lines.append("<table>")
+        lines.append(
+            "<tr><th>Indexed</th><th>Excluded</th><th>Blocked</th><th>Errors</th><th>Last Inspected</th><th>Last Crawl</th></tr>"
+        )
+        lines.append(
+            f"<tr><td>{summary['gsc_indexed_urls']}</td>"
+            f"<td>{summary['gsc_excluded_urls']}</td>"
+            f"<td>{summary['gsc_blocked_urls']}</td>"
+            f"<td>{summary['gsc_error_urls']}</td>"
+            f"<td>{esc(str(summary.get('gsc_last_checked', '-') or '-'))}</td>"
+            f"<td>{esc(str(summary.get('gsc_last_crawl', '-') or '-'))}</td></tr>"
+        )
+        lines.append("</table>")
     lines.append("<div><strong>Highlights</strong></div>")
     lines.append("<ul>")
     for item in summary["highlights"]:
@@ -3032,7 +3392,7 @@ def render_report(report: Report, output_path: str) -> None:
         else:
             lines.append("<table>")
             lines.append(
-                "<tr><th>URL</th><th>HTTP</th><th>Indexability</th><th>Content</th><th>JSON-LD</th><th>Microdata</th><th>RDFa</th><th>JSON-LD Objects</th><th>Microdata Objects</th><th>RDFa Objects</th><th>Issues</th><th>Warnings</th></tr>"
+                "<tr><th>URL</th><th>HTTP</th><th>Indexability</th><th>GSC</th><th>Content</th><th>JSON-LD</th><th>Microdata</th><th>RDFa</th><th>JSON-LD Objects</th><th>Microdata Objects</th><th>RDFa Objects</th><th>Issues</th><th>Warnings</th></tr>"
             )
             for result in site.urls:
                 http_status = result.http_status if result.http_status is not None else "-"
@@ -3063,6 +3423,7 @@ def render_report(report: Report, output_path: str) -> None:
                     f"<td>{esc(result.url)}</td>"
                     f"<td><span class='badge {badge}'>{http_status}</span></td>"
                     f"<td>{esc(result.indexability_status or '-')}</td>"
+                    f"<td>{esc(result.gsc_status or result.gsc_error or '-')}</td>"
                     f"<td>{esc(content_summary(result))}</td>"
                     f"<td>{jsonld_summary}</td>"
                     f"<td>{result.microdata_items}</td>"
@@ -3094,6 +3455,67 @@ def render_report(report: Report, output_path: str) -> None:
                         lines.append(f"<tr><td>Issue</td><td>{esc(issue)}</td></tr>")
                     for warning in result.warnings:
                         lines.append(f"<tr><td>Warning</td><td>{esc(warning)}</td></tr>")
+                    lines.append("</table>")
+
+                if result.gsc_status or result.gsc_error:
+                    lines.append("<div><strong>GSC Indexing</strong></div>")
+                    lines.append("<table>")
+                    if result.gsc_property:
+                        lines.append(
+                            f"<tr><th>Property</th><td>{esc(result.gsc_property)}</td></tr>"
+                        )
+                    if result.gsc_status:
+                        lines.append(
+                            f"<tr><th>Status</th><td>{esc(result.gsc_status)}</td></tr>"
+                        )
+                    if result.gsc_checked_at:
+                        lines.append(
+                            f"<tr><th>Checked At</th><td>{esc(result.gsc_checked_at)}</td></tr>"
+                        )
+                    if result.gsc_error:
+                        lines.append(
+                            f"<tr><th>Error</th><td>{esc(result.gsc_error)}</td></tr>"
+                        )
+                    if result.gsc_verdict:
+                        lines.append(
+                            f"<tr><th>Verdict</th><td>{esc(result.gsc_verdict)}</td></tr>"
+                        )
+                    if result.gsc_coverage_state:
+                        lines.append(
+                            f"<tr><th>Coverage State</th><td>{esc(result.gsc_coverage_state)}</td></tr>"
+                        )
+                    if result.gsc_indexing_state:
+                        lines.append(
+                            f"<tr><th>Indexing State</th><td>{esc(result.gsc_indexing_state)}</td></tr>"
+                        )
+                    if result.gsc_robots_state:
+                        lines.append(
+                            f"<tr><th>Robots State</th><td>{esc(result.gsc_robots_state)}</td></tr>"
+                        )
+                    if result.gsc_page_fetch_state:
+                        lines.append(
+                            f"<tr><th>Page Fetch State</th><td>{esc(result.gsc_page_fetch_state)}</td></tr>"
+                        )
+                    if result.gsc_last_crawl_time:
+                        lines.append(
+                            f"<tr><th>Last Crawl Time</th><td>{esc(result.gsc_last_crawl_time)}</td></tr>"
+                        )
+                    if result.gsc_google_canonical:
+                        lines.append(
+                            f"<tr><th>Google Canonical</th><td>{esc(result.gsc_google_canonical)}</td></tr>"
+                        )
+                    if result.gsc_user_canonical:
+                        lines.append(
+                            f"<tr><th>User Canonical</th><td>{esc(result.gsc_user_canonical)}</td></tr>"
+                        )
+                    if result.gsc_sitemaps:
+                        lines.append(
+                            f"<tr><th>Sitemaps</th><td>{esc('; '.join(result.gsc_sitemaps))}</td></tr>"
+                        )
+                    if result.gsc_referring_urls:
+                        lines.append(
+                            f"<tr><th>Referring URLs</th><td>{esc('; '.join(result.gsc_referring_urls))}</td></tr>"
+                        )
                     lines.append("</table>")
 
                 if result.indexability_status:
@@ -3607,8 +4029,13 @@ def build_report(
     sitemap_urls_by_domain: Dict[str, List[str]],
     page_urls_by_domain: Dict[str, List[str]],
     sitemap_mode: str,
+    gsc_json_path: str = "",
+    gsc_cache_path: str = DEFAULT_GSC_CACHE_PATH,
+    gsc_cache_ttl_hours: int = DEFAULT_GSC_CACHE_TTL_HOURS,
 ) -> Report:
     sites: List[SiteReport] = []
+    gsc_service, gsc_error = build_gsc_service(gsc_json_path) if gsc_json_path else (None, None)
+    gsc_cache = load_gsc_cache(gsc_cache_path) if gsc_service else {}
     for domain in domains:
         if sitemap_mode == "robots":
             sitemap_urls = None
@@ -3624,9 +4051,15 @@ def build_report(
             user_agent,
             rules,
             schemaorg_ref,
-            sitemap_urls,
-            page_urls,
+            gsc_service=gsc_service,
+            gsc_candidate_domains=domains,
+            gsc_cache=gsc_cache,
+            gsc_cache_ttl_hours=gsc_cache_ttl_hours,
+            sitemap_urls=sitemap_urls,
+            page_urls=page_urls,
         )
+        if gsc_error:
+            site_report.notes.append(gsc_error)
         sites.append(site_report)
     report = Report(
         generated_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3636,8 +4069,13 @@ def build_report(
         schemaorg_ref_path=schemaorg_ref_path,
         schemaorg_ref_loaded=bool(schemaorg_ref),
         schemaorg_types=len(schemaorg_ref),
+        gsc_enabled=bool(gsc_service),
+        gsc_json_path=gsc_json_path,
+        gsc_cache_path=gsc_cache_path,
         sites=sites,
     )
+    if gsc_service:
+        save_gsc_cache(gsc_cache_path, gsc_cache)
     apply_duplicate_canonical_flags(report)
     return report
 
@@ -3712,6 +4150,22 @@ def parse_args() -> argparse.Namespace:
         help="Disable auto-download of schema.org JSON-LD data file.",
     )
     parser.add_argument(
+        "--gsc-json",
+        default=DEFAULT_GSC_JSON_PATH,
+        help="Path to GSC service-account JSON file.",
+    )
+    parser.add_argument(
+        "--gsc-cache",
+        default=DEFAULT_GSC_CACHE_PATH,
+        help="Path to persistent GSC inspection cache JSON file.",
+    )
+    parser.add_argument(
+        "--gsc-cache-ttl-hours",
+        type=int,
+        default=DEFAULT_GSC_CACHE_TTL_HOURS,
+        help="Reuse cached GSC inspection results younger than this many hours.",
+    )
+    parser.add_argument(
         "--sitemap-url",
         nargs="*",
         default=None,
@@ -3771,6 +4225,9 @@ def main() -> int:
         sitemap_urls_by_domain,
         page_urls_by_domain,
         sitemap_mode,
+        args.gsc_json,
+        args.gsc_cache,
+        args.gsc_cache_ttl_hours,
     )
     render_report(report, args.output)
     print(f"Report written to {args.output}")

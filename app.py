@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 import validator
@@ -66,6 +67,46 @@ def compute_domains(
         if parsed.netloc:
             domains.append(parsed.netloc)
     return dedupe(domains)
+
+
+def classify_gsc_bucket(result: validator.UrlCheckResult) -> str:
+    if result.gsc_error:
+        return "Error"
+    if result.gsc_status == "Indexed":
+        return "Indexed"
+    if result.gsc_status == "Excluded":
+        return "Excluded"
+    if result.gsc_status in ("Blocked by robots.txt", "Blocked by noindex"):
+        return "Blocked"
+    if not result.gsc_status:
+        return "No GSC Data"
+    return "Other"
+
+
+def build_gsc_rows(report: validator.Report) -> list[dict[str, str | int]]:
+    rows: list[dict[str, str | int]] = []
+    for site in report.sites:
+        for result in site.urls:
+            rows.append(
+                {
+                    "Site": site.domain,
+                    "URL": result.url,
+                    "HTTP": result.http_status or "-",
+                    "GSC Category": classify_gsc_bucket(result),
+                    "GSC Status": result.gsc_status or "-",
+                    "Coverage State": result.gsc_coverage_state or "-",
+                    "Indexing State": result.gsc_indexing_state or "-",
+                    "Robots State": result.gsc_robots_state or "-",
+                    "Page Fetch State": result.gsc_page_fetch_state or "-",
+                    "Last Inspected": result.gsc_checked_at or "-",
+                    "Last Crawl": result.gsc_last_crawl_time or "-",
+                    "Google Canonical": result.gsc_google_canonical or "-",
+                    "User Canonical": result.gsc_user_canonical or "-",
+                    "GSC Property": result.gsc_property or "-",
+                    "GSC Error": result.gsc_error or "-",
+                }
+            )
+    return rows
 
 
 st.set_page_config(page_title="Schema & Sitemap Validator", layout="wide")
@@ -374,9 +415,17 @@ st.markdown(
 schemaorg_ref_path = str(validator.DEFAULT_SCHEMAORG_REF_PATH)
 schemaorg_data_path = str(validator.DEFAULT_SCHEMAORG_DATA_PATH)
 rules_path = str(validator.DEFAULT_RULES_PATH)
+gsc_json_path = str(validator.DEFAULT_GSC_JSON_PATH)
+gsc_cache_path = str(validator.DEFAULT_GSC_CACHE_PATH)
+gsc_cache_ttl_hours = validator.DEFAULT_GSC_CACHE_TTL_HOURS
 user_agent = validator.DEFAULT_USER_AGENT
 output_path = str(DEFAULT_OUTPUT)
 download_schemaorg = True
+
+if "latest_report" not in st.session_state:
+    st.session_state["latest_report"] = None
+if "latest_summary" not in st.session_state:
+    st.session_state["latest_summary"] = None
 
 with st.form("run_form"):
     col_a, col_b = st.columns([2.3, 1], gap="large")
@@ -458,16 +507,28 @@ if run_button:
             sitemap_urls_by_domain=sitemap_urls_by_domain,
             page_urls_by_domain=page_urls_by_domain,
             sitemap_mode=sitemap_mode,
+            gsc_json_path=gsc_json_path,
+            gsc_cache_path=gsc_cache_path,
+            gsc_cache_ttl_hours=gsc_cache_ttl_hours,
         )
         validator.render_report(report, output_path)
 
     # Report is saved locally; suppress banner to keep UI clean.
-    if use_schemaorg and not schemaorg_ref:
+    summary = validator.compute_executive_summary(report)
+    st.session_state["latest_report"] = report
+    st.session_state["latest_summary"] = summary
+
+current_report = st.session_state.get("latest_report")
+current_summary = st.session_state.get("latest_summary")
+
+if current_report and current_summary:
+    if not current_report.schemaorg_ref_loaded:
         st.warning(
             "Schema.org properties reference not loaded. "
             "Check your internet connection or provide the schema.org JSON-LD file path."
         )
-    summary = validator.compute_executive_summary(report)
+
+    summary = current_summary
     st.markdown("### Run Results")
     row1 = st.columns(4)
     row1[0].metric("Overall Score", f"{summary['score']}/100")
@@ -490,7 +551,41 @@ if run_button:
     row3[2].metric("Uncertain", summary.get("uncertain_urls", 0))
     row3[3].metric("Redirected", summary.get("redirected_urls", 0))
 
-    show_preview = st.checkbox("Show report preview", value=True)
+    row4 = st.columns(4)
+    row4[0].metric("GSC Indexed", summary.get("gsc_indexed_urls", 0))
+    row4[1].metric("GSC Excluded", summary.get("gsc_excluded_urls", 0))
+    row4[2].metric("GSC Blocked", summary.get("gsc_blocked_urls", 0))
+    row4[3].metric("GSC Errors", summary.get("gsc_error_urls", 0))
+
+    row5 = st.columns(2)
+    row5[0].metric("Last GSC Inspection", summary.get("gsc_last_checked", "-"))
+    row5[0].caption(f"Cache TTL: {gsc_cache_ttl_hours}h")
+    row5[1].metric("Last GSC Crawl", summary.get("gsc_last_crawl", "-"))
+    row5[1].caption("Latest crawl timestamp returned by Search Console")
+
+    gsc_rows = build_gsc_rows(current_report)
+    if gsc_rows:
+        filter_options = ["All", "Indexed", "Excluded", "Blocked", "Error", "No GSC Data", "Other"]
+        gsc_filter = st.selectbox("Filter URLs by GSC status", filter_options, index=0)
+        if gsc_filter == "All":
+            filtered_rows = gsc_rows
+        else:
+            filtered_rows = [row for row in gsc_rows if row["GSC Category"] == gsc_filter]
+        st.caption(f"Showing {len(filtered_rows)} of {len(gsc_rows)} audited URLs")
+        if filtered_rows:
+            filtered_df = pd.DataFrame(filtered_rows)
+            st.dataframe(
+                filtered_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "URL": st.column_config.LinkColumn("URL"),
+                },
+            )
+        else:
+            st.info("No URLs match the selected GSC filter.")
+
+    show_preview = st.checkbox("Show report preview", value=True, key="show_report_preview")
     if show_preview:
         with st.expander("Report preview", expanded=True):
             try:
