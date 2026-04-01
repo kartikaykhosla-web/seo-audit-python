@@ -473,6 +473,83 @@ if "latest_report" not in st.session_state:
     st.session_state["latest_report"] = None
 if "latest_summary" not in st.session_state:
     st.session_state["latest_summary"] = None
+if "latest_run_config" not in st.session_state:
+    st.session_state["latest_run_config"] = None
+if "latest_run_requested_gsc" not in st.session_state:
+    st.session_state["latest_run_requested_gsc"] = False
+
+
+def run_validation_audit(
+    *,
+    targets_text_value: str,
+    max_urls_value: int,
+    use_schemaorg_value: bool,
+    include_gsc: bool,
+) -> None:
+    targets = parse_multiline(targets_text_value)
+    input_domains, sitemap_urls, page_urls = classify_targets(targets)
+    domains = compute_domains(input_domains, sitemap_urls, page_urls)
+
+    if not domains:
+        st.error("Please enter at least one valid domain, sitemap URL, or page URL.")
+        st.stop()
+
+    if sitemap_urls:
+        sitemap_mode = "explicit"
+    elif input_domains:
+        sitemap_mode = "robots"
+    else:
+        sitemap_mode = "disabled"
+
+    rules = validator.load_schema_rules(rules_path)
+    schemaorg_ref = {}
+    if use_schemaorg_value:
+        schemaorg_ref = validator.load_schemaorg_reference(schemaorg_ref_path, schemaorg_data_path)
+        if download_schemaorg and not schemaorg_ref:
+            downloaded = validator.download_schemaorg_data(
+                validator.SCHEMAORG_DATA_URL, schemaorg_data_path
+            )
+            if downloaded:
+                schemaorg_ref = validator.load_schemaorg_reference(
+                    schemaorg_ref_path, schemaorg_data_path
+                )
+
+    sitemap_urls_by_domain = validator.group_by_domain(sitemap_urls)
+    page_urls_by_domain = validator.group_by_domain(page_urls)
+    effective_gsc_json_path = gsc_json_path if include_gsc else ""
+    spinner_label = (
+        "Running validation and fetching GSC status..."
+        if include_gsc
+        else "Running validation..."
+    )
+
+    with st.spinner(spinner_label):
+        report = validator.build_report(
+            domains=domains,
+            max_urls=max_urls_value,
+            user_agent=user_agent,
+            rules=rules,
+            rules_path=rules_path,
+            schemaorg_ref=schemaorg_ref,
+            schemaorg_ref_path=schemaorg_ref_path,
+            sitemap_urls_by_domain=sitemap_urls_by_domain,
+            page_urls_by_domain=page_urls_by_domain,
+            sitemap_mode=sitemap_mode,
+            gsc_json_path=effective_gsc_json_path,
+            gsc_cache_path=gsc_cache_path,
+            gsc_cache_ttl_hours=gsc_cache_ttl_hours,
+        )
+        validator.render_report(report, output_path)
+
+    summary = validator.compute_executive_summary(report)
+    st.session_state["latest_report"] = report
+    st.session_state["latest_summary"] = summary
+    st.session_state["latest_run_requested_gsc"] = include_gsc
+    st.session_state["latest_run_config"] = {
+        "targets_text": targets_text_value,
+        "max_urls": max_urls_value,
+        "use_schemaorg": use_schemaorg_value,
+    }
 
 with st.form("run_form"):
     col_a, col_b = st.columns([2.3, 1], gap="large")
@@ -509,70 +586,68 @@ with st.form("run_form"):
             "Show allowed schema.org nodes",
             value=True,
         )
-        run_button = st.form_submit_button("Run Validation", use_container_width=True)
+        st.caption("GSC checks are optional. Use the CTA below only when you want fresh indexing status.")
+        run_col, gsc_col = st.columns(2, gap="small")
+        with run_col:
+            run_button = st.form_submit_button("Run Validation", use_container_width=True)
+        with gsc_col:
+            run_with_gsc_button = st.form_submit_button(
+                "Run With GSC Status",
+                use_container_width=True,
+                disabled=not bool(gsc_json_path),
+            )
 
 if run_button:
-    targets = parse_multiline(targets_text)
-    input_domains, sitemap_urls, page_urls = classify_targets(targets)
-    domains = compute_domains(input_domains, sitemap_urls, page_urls)
+    run_validation_audit(
+        targets_text_value=targets_text,
+        max_urls_value=max_urls,
+        use_schemaorg_value=use_schemaorg,
+        include_gsc=False,
+    )
 
-    if not domains:
-        st.error("Please enter at least one valid domain, sitemap URL, or page URL.")
+if run_with_gsc_button:
+    if not gsc_json_path:
+        st.error("GSC is not configured in this deployment yet.")
         st.stop()
-
-    if sitemap_urls:
-        sitemap_mode = "explicit"
-    elif input_domains:
-        sitemap_mode = "robots"
-    else:
-        sitemap_mode = "disabled"
-
-    rules = validator.load_schema_rules(rules_path)
-    schemaorg_ref = {}
-    if use_schemaorg:
-        schemaorg_ref = validator.load_schemaorg_reference(schemaorg_ref_path, schemaorg_data_path)
-        if download_schemaorg and not schemaorg_ref:
-            downloaded = validator.download_schemaorg_data(
-                validator.SCHEMAORG_DATA_URL, schemaorg_data_path
-            )
-            if downloaded:
-                schemaorg_ref = validator.load_schemaorg_reference(
-                    schemaorg_ref_path, schemaorg_data_path
-                )
-    sitemap_urls_by_domain = validator.group_by_domain(sitemap_urls)
-    page_urls_by_domain = validator.group_by_domain(page_urls)
-
-    with st.spinner("Running validation..."):
-        report = validator.build_report(
-            domains=domains,
-            max_urls=max_urls,
-            user_agent=user_agent,
-            rules=rules,
-            rules_path=rules_path,
-            schemaorg_ref=schemaorg_ref,
-            schemaorg_ref_path=schemaorg_ref_path,
-            sitemap_urls_by_domain=sitemap_urls_by_domain,
-            page_urls_by_domain=page_urls_by_domain,
-            sitemap_mode=sitemap_mode,
-            gsc_json_path=gsc_json_path,
-            gsc_cache_path=gsc_cache_path,
-            gsc_cache_ttl_hours=gsc_cache_ttl_hours,
-        )
-        validator.render_report(report, output_path)
-
-    # Report is saved locally; suppress banner to keep UI clean.
-    summary = validator.compute_executive_summary(report)
-    st.session_state["latest_report"] = report
-    st.session_state["latest_summary"] = summary
+    run_validation_audit(
+        targets_text_value=targets_text,
+        max_urls_value=max_urls,
+        use_schemaorg_value=use_schemaorg,
+        include_gsc=True,
+    )
 
 current_report = st.session_state.get("latest_report")
 current_summary = st.session_state.get("latest_summary")
+current_run_requested_gsc = bool(st.session_state.get("latest_run_requested_gsc"))
+latest_run_config = st.session_state.get("latest_run_config")
 
 if current_report and current_summary:
-    if not current_report.gsc_enabled and not gsc_json_path:
+    if not gsc_json_path:
         st.info(
             "GSC is disabled in this deployment because no service-account JSON was found. "
             "Add it via Streamlit secrets to enable indexing checks."
+        )
+    elif not current_report.gsc_enabled and not current_run_requested_gsc:
+        cta_cols = st.columns([2.3, 1], gap="small")
+        with cta_cols[0]:
+            st.info("GSC status was skipped for this run to keep the audit fast. Request it only when needed.")
+        with cta_cols[1]:
+            request_gsc_now = st.button(
+                "Request GSC Status",
+                use_container_width=True,
+            )
+        if request_gsc_now and latest_run_config:
+            run_validation_audit(
+                targets_text_value=str(latest_run_config.get("targets_text", "")),
+                max_urls_value=int(latest_run_config.get("max_urls", validator.DEFAULT_MAX_URLS)),
+                use_schemaorg_value=bool(latest_run_config.get("use_schemaorg", True)),
+                include_gsc=True,
+            )
+            st.rerun()
+    elif current_run_requested_gsc and not current_report.gsc_enabled:
+        st.warning(
+            "GSC status was requested for this run, but Search Console could not be queried. "
+            "Please check the deployment credentials or property access."
         )
     if not current_report.schemaorg_ref_loaded:
         st.warning(
@@ -603,39 +678,40 @@ if current_report and current_summary:
     row3[2].metric("Uncertain", summary.get("uncertain_urls", 0))
     row3[3].metric("Redirected", summary.get("redirected_urls", 0))
 
-    row4 = st.columns(4)
-    row4[0].metric("GSC Indexed", summary.get("gsc_indexed_urls", 0))
-    row4[1].metric("GSC Excluded", summary.get("gsc_excluded_urls", 0))
-    row4[2].metric("GSC Blocked", summary.get("gsc_blocked_urls", 0))
-    row4[3].metric("GSC Errors", summary.get("gsc_error_urls", 0))
+    if current_report.gsc_enabled:
+        row4 = st.columns(4)
+        row4[0].metric("GSC Indexed", summary.get("gsc_indexed_urls", 0))
+        row4[1].metric("GSC Excluded", summary.get("gsc_excluded_urls", 0))
+        row4[2].metric("GSC Blocked", summary.get("gsc_blocked_urls", 0))
+        row4[3].metric("GSC Errors", summary.get("gsc_error_urls", 0))
 
-    row5 = st.columns(2)
-    row5[0].metric("Last GSC Inspection", summary.get("gsc_last_checked", "-"))
-    row5[0].caption(f"Cache TTL: {gsc_cache_ttl_hours}h")
-    row5[1].metric("Last GSC Crawl", summary.get("gsc_last_crawl", "-"))
-    row5[1].caption("Latest crawl timestamp returned by Search Console")
+        row5 = st.columns(2)
+        row5[0].metric("Last GSC Inspection", summary.get("gsc_last_checked", "-"))
+        row5[0].caption(f"Cache TTL: {gsc_cache_ttl_hours}h")
+        row5[1].metric("Last GSC Crawl", summary.get("gsc_last_crawl", "-"))
+        row5[1].caption("Latest crawl timestamp returned by Search Console")
 
-    gsc_rows = build_gsc_rows(current_report)
-    if gsc_rows:
-        filter_options = ["All", "Indexed", "Excluded", "Blocked", "Error", "No GSC Data", "Other"]
-        gsc_filter = st.selectbox("Filter URLs by GSC status", filter_options, index=0)
-        if gsc_filter == "All":
-            filtered_rows = gsc_rows
-        else:
-            filtered_rows = [row for row in gsc_rows if row["GSC Category"] == gsc_filter]
-        st.caption(f"Showing {len(filtered_rows)} of {len(gsc_rows)} audited URLs")
-        if filtered_rows:
-            filtered_df = pd.DataFrame(filtered_rows)
-            st.dataframe(
-                filtered_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "URL": st.column_config.LinkColumn("URL"),
-                },
-            )
-        else:
-            st.info("No URLs match the selected GSC filter.")
+        gsc_rows = build_gsc_rows(current_report)
+        if gsc_rows:
+            filter_options = ["All", "Indexed", "Excluded", "Blocked", "Error", "No GSC Data", "Other"]
+            gsc_filter = st.selectbox("Filter URLs by GSC status", filter_options, index=0)
+            if gsc_filter == "All":
+                filtered_rows = gsc_rows
+            else:
+                filtered_rows = [row for row in gsc_rows if row["GSC Category"] == gsc_filter]
+            st.caption(f"Showing {len(filtered_rows)} of {len(gsc_rows)} audited URLs")
+            if filtered_rows:
+                filtered_df = pd.DataFrame(filtered_rows)
+                st.dataframe(
+                    filtered_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "URL": st.column_config.LinkColumn("URL"),
+                    },
+                )
+            else:
+                st.info("No URLs match the selected GSC filter.")
 
     show_preview = st.checkbox("Show report preview", value=True, key="show_report_preview")
     if show_preview:
