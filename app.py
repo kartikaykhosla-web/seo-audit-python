@@ -477,6 +477,8 @@ if "latest_run_config" not in st.session_state:
     st.session_state["latest_run_config"] = None
 if "latest_run_requested_gsc" not in st.session_state:
     st.session_state["latest_run_requested_gsc"] = False
+if "active_url_detail" not in st.session_state:
+    st.session_state["active_url_detail"] = ""
 
 
 def run_validation_audit(
@@ -551,6 +553,129 @@ def run_validation_audit(
         "use_schemaorg": use_schemaorg_value,
     }
 
+
+def report_candidate_domains(report: validator.Report) -> list[str]:
+    return [site.domain for site in report.sites]
+
+
+def apply_gsc_result_to_url_result(
+    result: validator.UrlCheckResult, gsc_result: dict[str, object], gsc_property: str
+) -> None:
+    result.gsc_property = gsc_property or str(gsc_result.get("property", "") or "")
+    result.gsc_status = str(gsc_result.get("status", "") or "")
+    result.gsc_verdict = str(gsc_result.get("verdict", "") or "")
+    result.gsc_coverage_state = str(gsc_result.get("coverage_state", "") or "")
+    result.gsc_indexing_state = str(gsc_result.get("indexing_state", "") or "")
+    result.gsc_robots_state = str(gsc_result.get("robots_state", "") or "")
+    result.gsc_page_fetch_state = str(gsc_result.get("page_fetch_state", "") or "")
+    result.gsc_last_crawl_time = str(gsc_result.get("last_crawl_time", "") or "")
+    result.gsc_google_canonical = str(gsc_result.get("google_canonical", "") or "")
+    result.gsc_user_canonical = str(gsc_result.get("user_canonical", "") or "")
+    result.gsc_sitemaps = list(gsc_result.get("sitemaps", []) or [])
+    result.gsc_referring_urls = list(gsc_result.get("referring_urls", []) or [])
+    result.gsc_error = str(gsc_result.get("error", "") or "")
+    result.gsc_checked_at = str(gsc_result.get("checked_at", "") or "")
+
+
+def fetch_on_demand_gsc_status(report: validator.Report, result: validator.UrlCheckResult) -> None:
+    service, error = validator.build_gsc_service(gsc_json_path) if gsc_json_path else (None, "GSC JSON path not provided")
+    gsc_result: dict[str, object]
+    gsc_property = ""
+    if service is None:
+        gsc_result = {
+            "status": "",
+            "error": error or "GSC service unavailable",
+            "checked_at": "",
+        }
+    else:
+        gsc_property = validator.infer_gsc_property(result.url, report_candidate_domains(report))
+        if not gsc_property:
+            gsc_result = {
+                "status": "",
+                "property": "",
+                "error": "No GSC property mapping configured for this domain",
+                "checked_at": "",
+            }
+        else:
+            gsc_result = validator.inspect_url_in_gsc(service, result.url, gsc_property)
+            cache = validator.load_gsc_cache(gsc_cache_path)
+            validator.set_cached_gsc_result(cache, gsc_property, result.url, gsc_result)
+            validator.save_gsc_cache(gsc_cache_path, cache)
+
+    apply_gsc_result_to_url_result(result, gsc_result, gsc_property)
+    report.gsc_enabled = bool(service)
+    st.session_state["latest_report"] = report
+    st.session_state["latest_summary"] = validator.compute_executive_summary(report)
+    st.session_state["latest_run_requested_gsc"] = True
+    st.session_state["active_url_detail"] = result.url
+
+
+def render_url_detail_block(site: validator.SiteReport, result: validator.UrlCheckResult, index: int) -> None:
+    detail_key = f"{site.domain}::{index}"
+    expanded = st.session_state.get("active_url_detail") == result.url
+    label = result.url if len(result.url) <= 120 else f"{result.url[:117]}..."
+    with st.expander(label, expanded=expanded):
+        top = st.columns(4)
+        top[0].metric("HTTP", str(result.http_status or "-"))
+        top[1].metric("Indexability", result.indexability_status or "-")
+        top[2].metric("Word Count", str(result.word_count or 0))
+        top[3].metric(
+            "Headings",
+            f"H1:{result.heading_h1_count} H2:{result.heading_h2_count} H3:{result.heading_h3_count}",
+        )
+
+        st.caption(f"Feature image alt: {result.feature_image_status or '-'}")
+
+        button_label = "Refresh GSC Status" if (result.gsc_status or result.gsc_error) else "Request GSC Status"
+        if gsc_json_path:
+            if st.button(button_label, key=f"gsc_{detail_key}", use_container_width=True):
+                fetch_on_demand_gsc_status(st.session_state["latest_report"], result)
+                st.rerun()
+        else:
+            st.caption("GSC is not configured in this deployment.")
+
+        basic_rows = [
+            {"Field": "URL", "Value": result.url},
+            {"Field": "Final URL", "Value": result.final_url or "-"},
+            {"Field": "Meta Title", "Value": result.seo_meta.get("title", "-")},
+            {"Field": "Meta Description", "Value": result.seo_meta.get("description", "-")},
+            {"Field": "Canonical", "Value": result.seo_meta.get("canonical", "-")},
+            {"Field": "Feature Image Alt", "Value": result.feature_image_alt or "-"},
+            {"Field": "Schema Types", "Value": ", ".join(result.jsonld_types) if result.jsonld_types else "-"},
+        ]
+        st.table(pd.DataFrame(basic_rows))
+
+        if result.gsc_status or result.gsc_error or result.gsc_checked_at:
+            st.markdown("##### GSC Details")
+            gsc_rows = [
+                {"Field": "Status", "Value": result.gsc_status or "-"},
+                {"Field": "Property", "Value": result.gsc_property or "-"},
+                {"Field": "Checked At", "Value": result.gsc_checked_at or "-"},
+                {"Field": "Verdict", "Value": result.gsc_verdict or "-"},
+                {"Field": "Coverage State", "Value": result.gsc_coverage_state or "-"},
+                {"Field": "Indexing State", "Value": result.gsc_indexing_state or "-"},
+                {"Field": "Robots State", "Value": result.gsc_robots_state or "-"},
+                {"Field": "Page Fetch State", "Value": result.gsc_page_fetch_state or "-"},
+                {"Field": "Last Crawl Time", "Value": result.gsc_last_crawl_time or "-"},
+                {"Field": "Google Canonical", "Value": result.gsc_google_canonical or "-"},
+                {"Field": "User Canonical", "Value": result.gsc_user_canonical or "-"},
+                {"Field": "Error", "Value": result.gsc_error or "-"},
+            ]
+            st.table(pd.DataFrame(gsc_rows))
+
+        if result.issues or result.warnings or result.seo_issues or result.seo_warnings:
+            st.markdown("##### Audit Notes")
+            notes = []
+            for item in result.issues:
+                notes.append({"Type": "Issue", "Detail": item})
+            for item in result.warnings:
+                notes.append({"Type": "Warning", "Detail": item})
+            for item in result.seo_issues:
+                notes.append({"Type": "SEO Issue", "Detail": item})
+            for item in result.seo_warnings:
+                notes.append({"Type": "SEO Warning", "Detail": item})
+            st.table(pd.DataFrame(notes))
+
 with st.form("run_form"):
     col_a, col_b = st.columns([2.3, 1], gap="large")
     with col_a:
@@ -586,16 +711,8 @@ with st.form("run_form"):
             "Show allowed schema.org nodes",
             value=True,
         )
-        st.caption("GSC checks are optional. Use the CTA below only when you want fresh indexing status.")
-        run_col, gsc_col = st.columns(2, gap="small")
-        with run_col:
-            run_button = st.form_submit_button("Run Validation", use_container_width=True)
-        with gsc_col:
-            run_with_gsc_button = st.form_submit_button(
-                "Run With GSC Status",
-                use_container_width=True,
-                disabled=not bool(gsc_json_path),
-            )
+        st.caption("Run the audit first. You can request GSC status per URL from the results section.")
+        run_button = st.form_submit_button("Run Validation", use_container_width=True)
 
 if run_button:
     run_validation_audit(
@@ -603,17 +720,6 @@ if run_button:
         max_urls_value=max_urls,
         use_schemaorg_value=use_schemaorg,
         include_gsc=False,
-    )
-
-if run_with_gsc_button:
-    if not gsc_json_path:
-        st.error("GSC is not configured in this deployment yet.")
-        st.stop()
-    run_validation_audit(
-        targets_text_value=targets_text,
-        max_urls_value=max_urls,
-        use_schemaorg_value=use_schemaorg,
-        include_gsc=True,
     )
 
 current_report = st.session_state.get("latest_report")
@@ -627,26 +733,9 @@ if current_report and current_summary:
             "GSC is disabled in this deployment because no service-account JSON was found. "
             "Add it via Streamlit secrets to enable indexing checks."
         )
-    elif not current_report.gsc_enabled and not current_run_requested_gsc:
-        cta_cols = st.columns([2.3, 1], gap="small")
-        with cta_cols[0]:
-            st.info("GSC status was skipped for this run to keep the audit fast. Request it only when needed.")
-        with cta_cols[1]:
-            request_gsc_now = st.button(
-                "Request GSC Status",
-                use_container_width=True,
-            )
-        if request_gsc_now and latest_run_config:
-            run_validation_audit(
-                targets_text_value=str(latest_run_config.get("targets_text", "")),
-                max_urls_value=int(latest_run_config.get("max_urls", validator.DEFAULT_MAX_URLS)),
-                use_schemaorg_value=bool(latest_run_config.get("use_schemaorg", True)),
-                include_gsc=True,
-            )
-            st.rerun()
     elif current_run_requested_gsc and not current_report.gsc_enabled:
         st.warning(
-            "GSC status was requested for this run, but Search Console could not be queried. "
+            "A GSC request was attempted, but Search Console could not be queried. "
             "Please check the deployment credentials or property access."
         )
     if not current_report.schemaorg_ref_loaded:
@@ -712,6 +801,13 @@ if current_report and current_summary:
                 )
             else:
                 st.info("No URLs match the selected GSC filter.")
+
+    st.markdown("### Per-URL Actions")
+    st.caption("Use the button inside each URL card when you want live GSC status for that specific page.")
+    for site in current_report.sites:
+        st.markdown(f"#### {site.domain}")
+        for index, result in enumerate(site.urls):
+            render_url_detail_block(site, result, index)
 
     show_preview = st.checkbox("Show report preview", value=True, key="show_report_preview")
     if show_preview:
