@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -13,6 +16,8 @@ import validator
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = APP_DIR / "report.html"
+DEFAULT_DEPLOYED_GSC_JSON = Path(tempfile.gettempdir()) / "schema-validator-gsc-service-account.json"
+DEFAULT_DEPLOYED_GSC_CACHE = Path(tempfile.gettempdir()) / "schema-validator-gsc-cache.json"
 
 
 def parse_multiline(value: str) -> list[str]:
@@ -67,6 +72,48 @@ def compute_domains(
         if parsed.netloc:
             domains.append(parsed.netloc)
     return dedupe(domains)
+
+
+def resolve_gsc_json_path() -> str:
+    default_path = Path(validator.DEFAULT_GSC_JSON_PATH)
+    if default_path.exists():
+        return str(default_path)
+
+    secret_candidates = []
+    if "gsc_service_account" in st.secrets:
+        secret_candidates.append(st.secrets["gsc_service_account"])
+    if "gsc_service_account_json" in st.secrets:
+        secret_candidates.append(st.secrets["gsc_service_account_json"])
+
+    env_json = os.environ.get("GSC_SERVICE_ACCOUNT_JSON", "").strip()
+    if env_json:
+        secret_candidates.append(env_json)
+
+    for candidate in secret_candidates:
+        if not candidate:
+            continue
+        try:
+            if isinstance(candidate, str):
+                payload = json.loads(candidate)
+            else:
+                payload = dict(candidate)
+            DEFAULT_DEPLOYED_GSC_JSON.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return str(DEFAULT_DEPLOYED_GSC_JSON)
+        except Exception:
+            continue
+
+    return ""
+
+
+def resolve_gsc_cache_path() -> str:
+    default_cache = Path(validator.DEFAULT_GSC_CACHE_PATH)
+    default_parent = default_cache.parent
+    if default_parent.exists() and os.access(default_parent, os.W_OK):
+        return str(default_cache)
+    return str(DEFAULT_DEPLOYED_GSC_CACHE)
 
 
 def classify_gsc_bucket(result: validator.UrlCheckResult) -> str:
@@ -415,8 +462,8 @@ st.markdown(
 schemaorg_ref_path = str(validator.DEFAULT_SCHEMAORG_REF_PATH)
 schemaorg_data_path = str(validator.DEFAULT_SCHEMAORG_DATA_PATH)
 rules_path = str(validator.DEFAULT_RULES_PATH)
-gsc_json_path = str(validator.DEFAULT_GSC_JSON_PATH)
-gsc_cache_path = str(validator.DEFAULT_GSC_CACHE_PATH)
+gsc_json_path = resolve_gsc_json_path()
+gsc_cache_path = resolve_gsc_cache_path()
 gsc_cache_ttl_hours = validator.DEFAULT_GSC_CACHE_TTL_HOURS
 user_agent = validator.DEFAULT_USER_AGENT
 output_path = str(DEFAULT_OUTPUT)
@@ -522,6 +569,11 @@ current_report = st.session_state.get("latest_report")
 current_summary = st.session_state.get("latest_summary")
 
 if current_report and current_summary:
+    if not current_report.gsc_enabled and not gsc_json_path:
+        st.info(
+            "GSC is disabled in this deployment because no service-account JSON was found. "
+            "Add it via Streamlit secrets to enable indexing checks."
+        )
     if not current_report.schemaorg_ref_loaded:
         st.warning(
             "Schema.org properties reference not loaded. "
