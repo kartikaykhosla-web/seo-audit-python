@@ -8,7 +8,6 @@ import os
 import tempfile
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 import validator
@@ -130,14 +129,16 @@ def classify_gsc_bucket(result: validator.UrlCheckResult) -> str:
     return "Other"
 
 
-def build_gsc_rows(report: validator.Report) -> list[dict[str, str | int]]:
-    rows: list[dict[str, str | int]] = []
+def build_gsc_rows(report: validator.Report) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
     for site in report.sites:
-        for result in site.urls:
+        for index, result in enumerate(site.urls):
             rows.append(
                 {
+                    "Row Key": f"{site.domain}::{index}",
                     "Site": site.domain,
                     "URL": result.url,
+                    "Result": result,
                     "HTTP": result.http_status or "-",
                     "GSC Category": classify_gsc_bucket(result),
                     "GSC Status": result.gsc_status or "-",
@@ -607,74 +608,58 @@ def fetch_on_demand_gsc_status(report: validator.Report, result: validator.UrlCh
     st.session_state["latest_report"] = report
     st.session_state["latest_summary"] = validator.compute_executive_summary(report)
     st.session_state["latest_run_requested_gsc"] = True
-    st.session_state["active_url_detail"] = result.url
 
 
-def render_url_detail_block(site: validator.SiteReport, result: validator.UrlCheckResult, index: int) -> None:
-    detail_key = f"{site.domain}::{index}"
-    expanded = st.session_state.get("active_url_detail") == result.url
-    label = result.url if len(result.url) <= 120 else f"{result.url[:117]}..."
-    with st.expander(label, expanded=expanded):
-        top = st.columns(4)
-        top[0].metric("HTTP", str(result.http_status or "-"))
-        top[1].metric("Indexability", result.indexability_status or "-")
-        top[2].metric("Word Count", str(result.word_count or 0))
-        top[3].metric(
-            "Headings",
-            f"H1:{result.heading_h1_count} H2:{result.heading_h2_count} H3:{result.heading_h3_count}",
-        )
+def render_gsc_action_table(report: validator.Report) -> None:
+    gsc_rows = build_gsc_rows(report)
+    if not gsc_rows:
+        return
 
-        st.caption(f"Feature image alt: {result.feature_image_status or '-'}")
+    filter_options = ["All", "Indexed", "Excluded", "Blocked", "Error", "No GSC Data", "Other"]
+    gsc_filter = st.selectbox("Filter URLs by GSC status", filter_options, index=0)
+    if gsc_filter == "All":
+        filtered_rows = gsc_rows
+    else:
+        filtered_rows = [row for row in gsc_rows if row["GSC Category"] == gsc_filter]
 
-        button_label = "Refresh GSC Status" if (result.gsc_status or result.gsc_error) else "Request GSC Status"
+    st.caption(f"Showing {len(filtered_rows)} of {len(gsc_rows)} audited URLs")
+    if not filtered_rows:
+        st.info("No URLs match the selected GSC filter.")
+        return
+
+    header_cols = st.columns([1.3, 4.8, 0.7, 1.2, 1.2, 1.8, 1.8, 1.4], gap="small")
+    header_labels = [
+        "Site",
+        "URL",
+        "HTTP",
+        "GSC Category",
+        "GSC Status",
+        "Coverage State",
+        "Indexing State",
+        "Action",
+    ]
+    for column, label in zip(header_cols, header_labels):
+        column.markdown(f"**{label}**")
+
+    for row in filtered_rows:
+        result = row["Result"]
+        row_key = str(row["Row Key"])
+        button_label = "Refresh GSC" if (result.gsc_status or result.gsc_error) else "Fetch GSC"
+        cols = st.columns([1.3, 4.8, 0.7, 1.2, 1.2, 1.8, 1.8, 1.4], gap="small")
+        cols[0].write(str(row["Site"]))
+        cols[1].markdown(f"[{result.url}]({result.url})")
+        cols[2].write(str(row["HTTP"]))
+        cols[3].write(str(row["GSC Category"]))
+        cols[4].write(str(row["GSC Status"]))
+        cols[5].write(str(row["Coverage State"]))
+        cols[6].write(str(row["Indexing State"]))
         if gsc_json_path:
-            if st.button(button_label, key=f"gsc_{detail_key}", use_container_width=True):
+            if cols[7].button(button_label, key=f"gsc_table_{row_key}", use_container_width=True):
                 fetch_on_demand_gsc_status(st.session_state["latest_report"], result)
                 st.rerun()
         else:
-            st.caption("GSC is not configured in this deployment.")
-
-        basic_rows = [
-            {"Field": "URL", "Value": result.url},
-            {"Field": "Final URL", "Value": result.final_url or "-"},
-            {"Field": "Meta Title", "Value": result.seo_meta.get("title", "-")},
-            {"Field": "Meta Description", "Value": result.seo_meta.get("description", "-")},
-            {"Field": "Canonical", "Value": result.seo_meta.get("canonical", "-")},
-            {"Field": "Feature Image Alt", "Value": result.feature_image_alt or "-"},
-            {"Field": "Schema Types", "Value": ", ".join(result.jsonld_types) if result.jsonld_types else "-"},
-        ]
-        st.table(pd.DataFrame(basic_rows))
-
-        if result.gsc_status or result.gsc_error or result.gsc_checked_at:
-            st.markdown("##### GSC Details")
-            gsc_rows = [
-                {"Field": "Status", "Value": result.gsc_status or "-"},
-                {"Field": "Property", "Value": result.gsc_property or "-"},
-                {"Field": "Checked At", "Value": result.gsc_checked_at or "-"},
-                {"Field": "Verdict", "Value": result.gsc_verdict or "-"},
-                {"Field": "Coverage State", "Value": result.gsc_coverage_state or "-"},
-                {"Field": "Indexing State", "Value": result.gsc_indexing_state or "-"},
-                {"Field": "Robots State", "Value": result.gsc_robots_state or "-"},
-                {"Field": "Page Fetch State", "Value": result.gsc_page_fetch_state or "-"},
-                {"Field": "Last Crawl Time", "Value": result.gsc_last_crawl_time or "-"},
-                {"Field": "Google Canonical", "Value": result.gsc_google_canonical or "-"},
-                {"Field": "User Canonical", "Value": result.gsc_user_canonical or "-"},
-                {"Field": "Error", "Value": result.gsc_error or "-"},
-            ]
-            st.table(pd.DataFrame(gsc_rows))
-
-        if result.issues or result.warnings or result.seo_issues or result.seo_warnings:
-            st.markdown("##### Audit Notes")
-            notes = []
-            for item in result.issues:
-                notes.append({"Type": "Issue", "Detail": item})
-            for item in result.warnings:
-                notes.append({"Type": "Warning", "Detail": item})
-            for item in result.seo_issues:
-                notes.append({"Type": "SEO Issue", "Detail": item})
-            for item in result.seo_warnings:
-                notes.append({"Type": "SEO Warning", "Detail": item})
-            st.table(pd.DataFrame(notes))
+            cols[7].button("GSC Off", key=f"gsc_table_{row_key}", use_container_width=True, disabled=True)
+        st.divider()
 
 with st.form("run_form"):
     col_a, col_b = st.columns([2.3, 1], gap="large")
@@ -711,7 +696,7 @@ with st.form("run_form"):
             "Show allowed schema.org nodes",
             value=True,
         )
-        st.caption("Run the audit first. You can request GSC status per URL from the results section.")
+        st.caption("Run the audit first. You can fetch GSC status from the URL table in the results section.")
         run_button = st.form_submit_button("Run Validation", use_container_width=True)
 
 if run_button:
@@ -767,6 +752,7 @@ if current_report and current_summary:
     row3[2].metric("Uncertain", summary.get("uncertain_urls", 0))
     row3[3].metric("Redirected", summary.get("redirected_urls", 0))
 
+    gsc_rows = build_gsc_rows(current_report)
     if current_report.gsc_enabled:
         row4 = st.columns(4)
         row4[0].metric("GSC Indexed", summary.get("gsc_indexed_urls", 0))
@@ -780,34 +766,8 @@ if current_report and current_summary:
         row5[1].metric("Last GSC Crawl", summary.get("gsc_last_crawl", "-"))
         row5[1].caption("Latest crawl timestamp returned by Search Console")
 
-        gsc_rows = build_gsc_rows(current_report)
-        if gsc_rows:
-            filter_options = ["All", "Indexed", "Excluded", "Blocked", "Error", "No GSC Data", "Other"]
-            gsc_filter = st.selectbox("Filter URLs by GSC status", filter_options, index=0)
-            if gsc_filter == "All":
-                filtered_rows = gsc_rows
-            else:
-                filtered_rows = [row for row in gsc_rows if row["GSC Category"] == gsc_filter]
-            st.caption(f"Showing {len(filtered_rows)} of {len(gsc_rows)} audited URLs")
-            if filtered_rows:
-                filtered_df = pd.DataFrame(filtered_rows)
-                st.dataframe(
-                    filtered_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "URL": st.column_config.LinkColumn("URL"),
-                    },
-                )
-            else:
-                st.info("No URLs match the selected GSC filter.")
-
-    st.markdown("### Per-URL Actions")
-    st.caption("Use the button inside each URL card when you want live GSC status for that specific page.")
-    for site in current_report.sites:
-        st.markdown(f"#### {site.domain}")
-        for index, result in enumerate(site.urls):
-            render_url_detail_block(site, result, index)
+    if gsc_rows:
+        render_gsc_action_table(current_report)
 
     show_preview = st.checkbox("Show report preview", value=True, key="show_report_preview")
     if show_preview:
