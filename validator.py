@@ -1485,10 +1485,22 @@ def normalize_text_content(value: str) -> str:
     return re.sub(r"\s+", " ", value or "").strip()
 
 
+WORD_TOKEN_EDGE_CHARS = "\"'`.,!?;:()[]{}<>|/\\@#$%^&*_+=~\u0964\u0965\u2013\u2014\u2018\u2019\u201c\u201d\u2026"
+
+
 def count_words(value: str) -> int:
     if not value:
         return 0
-    return len(re.findall(r"\b[\w'-]+\b", value, flags=re.UNICODE))
+    normalized = normalize_text_content(html.unescape(value))
+    if not normalized:
+        return 0
+
+    count = 0
+    for token in normalized.split():
+        cleaned = token.strip(WORD_TOKEN_EDGE_CHARS)
+        if cleaned and any(char.isalnum() for char in cleaned):
+            count += 1
+    return count
 
 
 def normalize_heading_text(value: str) -> str:
