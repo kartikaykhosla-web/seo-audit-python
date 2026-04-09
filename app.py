@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import re
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -17,6 +20,9 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = APP_DIR / "report.html"
 DEFAULT_DEPLOYED_GSC_JSON = Path(tempfile.gettempdir()) / "schema-validator-gsc-service-account.json"
 DEFAULT_DEPLOYED_GSC_CACHE = Path(tempfile.gettempdir()) / "schema-validator-gsc-cache.json"
+IST = timezone(timedelta(hours=5, minutes=30))
+DEFAULT_LOGIN_SPREADSHEET_ID = "1-wGQoVKu0GqcsHJDT0pCIakEO-bIdXhzmV5ydn4kkNw"
+DEFAULT_LOGIN_WORKSHEET_NAME = "seo audit tool login"
 
 
 def parse_multiline(value: str) -> list[str]:
@@ -137,6 +143,7 @@ def build_gsc_rows(report: validator.Report) -> list[dict[str, object]]:
                 {
                     "Row Key": f"{site.domain}::{index}",
                     "Site": site.domain,
+                    "Site Report": site,
                     "URL": result.url,
                     "Result": result,
                     "HTTP": result.http_status or "-",
@@ -155,6 +162,455 @@ def build_gsc_rows(report: validator.Report) -> list[dict[str, object]]:
                 }
             )
     return rows
+
+
+def iter_report_urls(
+    report: validator.Report,
+) -> list[tuple[validator.SiteReport, validator.UrlCheckResult, int]]:
+    rows: list[tuple[validator.SiteReport, validator.UrlCheckResult, int]] = []
+    for site in report.sites:
+        for index, result in enumerate(site.urls):
+            rows.append((site, result, index))
+    return rows
+
+
+def resolve_login_spreadsheet_id() -> str:
+    if "login_history_spreadsheet_id" in st.secrets:
+        return str(st.secrets["login_history_spreadsheet_id"]).strip()
+    env_value = os.environ.get("SEO_AUDIT_LOGIN_SPREADSHEET_ID", "").strip()
+    if env_value:
+        return env_value
+    return DEFAULT_LOGIN_SPREADSHEET_ID
+
+
+def resolve_login_worksheet_name() -> str:
+    if "login_history_worksheet_name" in st.secrets:
+        return str(st.secrets["login_history_worksheet_name"]).strip()
+    env_value = os.environ.get("SEO_AUDIT_LOGIN_WORKSHEET_NAME", "").strip()
+    if env_value:
+        return env_value
+    return DEFAULT_LOGIN_WORKSHEET_NAME
+
+
+def ist_now() -> datetime:
+    return datetime.now(IST).replace(microsecond=0)
+
+
+def iso_to_display(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=IST)
+        return parsed.astimezone(IST).replace(microsecond=0).isoformat()
+    except Exception:
+        return raw
+
+
+def normalize_username(username: str) -> tuple[str, str]:
+    value = str(username or "").strip().lower().replace(" ", "")
+    if not value:
+        return "", "Please enter your Jagran username."
+    if "@" in value:
+        return "", "Use only the username, without the email domain."
+    if not re.fullmatch(r"[a-z0-9._-]+", value):
+        return "", "Username can only contain letters, numbers, dot, underscore, or hyphen."
+    return value, ""
+
+
+def build_sheets_service(service_account_json_path: str):
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+
+    credentials = service_account.Credentials.from_service_account_file(
+        service_account_json_path,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return build("sheets", "v4", credentials=credentials, cache_discovery=False)
+
+
+def ensure_login_sheet(
+    sheets_service,
+    spreadsheet_id: str,
+    worksheet_name: str,
+) -> None:
+    metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    titles = {
+        sheet["properties"]["title"]
+        for sheet in metadata.get("sheets", [])
+        if sheet.get("properties", {}).get("title")
+    }
+    if worksheet_name not in titles:
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": worksheet_name}}}]},
+        ).execute()
+
+    header_range = f"{worksheet_name}!A1:C1"
+    existing = (
+        sheets_service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=header_range)
+        .execute()
+        .get("values", [])
+    )
+    if not existing:
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{worksheet_name}!A1",
+            valueInputOption="RAW",
+            body={"values": [["date", "username", "logged_in_at"]]},
+        ).execute()
+
+
+def append_login_history_row(
+    service_account_json_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    username: str,
+    logged_in_at: str,
+) -> None:
+    if not service_account_json_path or not spreadsheet_id:
+        return
+    sheets_service = build_sheets_service(service_account_json_path)
+    ensure_login_sheet(sheets_service, spreadsheet_id, worksheet_name)
+    row = [[logged_in_at[:10], username, logged_in_at]]
+    sheets_service.spreadsheets().values().append(
+        spreadsheetId=spreadsheet_id,
+        range=f"{worksheet_name}!A1",
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": row},
+    ).execute()
+
+
+def friendly_login_sheet_error(raw_error: str) -> str:
+    message = str(raw_error or "").strip()
+    lowered = message.lower()
+    if not message:
+        return ""
+    if "404" in lowered or "requested entity was not found" in lowered:
+        return "Login sheet not found. Please recheck the spreadsheet ID and sheet access."
+    if "403" in lowered or "permission" in lowered or "access denied" in lowered:
+        return "Login sheet access denied. Please share the sheet with the service account."
+    return "Login logging could not be completed. Please verify the sheet ID and service-account access."
+
+
+def require_login(service_account_json_path: str, spreadsheet_id: str, worksheet_name: str) -> tuple[str, str]:
+    username = str(st.session_state.get("logged_in_username", "")).strip().lower()
+    logged_in_at = str(st.session_state.get("logged_in_at", "")).strip()
+    if username and logged_in_at:
+        return username, logged_in_at
+
+    st.markdown(
+        """
+<div class="header-bar">
+  <div class="header-title">Schema & Sitemap Validator</div>
+  <div class="header-sub">Log in with your Jagran username to access the audit dashboard.</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    with st.form("login_form", clear_on_submit=False):
+        username_input = st.text_input("Username", placeholder="firstname.lastname")
+        submitted = st.form_submit_button("Continue", use_container_width=True)
+
+    if submitted:
+        normalized, error = normalize_username(username_input)
+        if error:
+            st.error(error)
+        else:
+            logged_in_at = ist_now().isoformat()
+            st.session_state["logged_in_username"] = normalized
+            st.session_state["logged_in_at"] = logged_in_at
+            try:
+                append_login_history_row(
+                    service_account_json_path,
+                    spreadsheet_id,
+                    worksheet_name,
+                    normalized,
+                    logged_in_at,
+                )
+                st.session_state.pop("login_sheet_error", None)
+            except Exception as exc:
+                st.session_state["login_sheet_error"] = str(exc)
+            st.rerun()
+    st.stop()
+
+
+def render_app_header(username: str) -> None:
+    title_col, action_col = st.columns([12, 1])
+    with title_col:
+        st.markdown(
+            """
+<div class="header-bar">
+  <div class="header-title">Schema & Sitemap Validator</div>
+  <div class="header-sub">One run, full SEO audit with schema + sitemap insights.</div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+    with action_col:
+        st.markdown("<div style='height: 0.9rem;'></div>", unsafe_allow_html=True)
+        if st.button("⎋", help=f"Log out ({username})", key="logout_icon_button", use_container_width=True):
+            st.session_state.pop("logged_in_username", None)
+            st.session_state.pop("logged_in_at", None)
+            st.rerun()
+
+    if st.session_state.get("login_sheet_error"):
+        st.warning(friendly_login_sheet_error(st.session_state["login_sheet_error"]))
+
+
+def _pdf_modules():
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+        from reportlab.lib.units import inch
+        from reportlab.platypus import (
+            ListFlowable,
+            ListItem,
+            Paragraph,
+            SimpleDocTemplate,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF export requires the 'reportlab' package. Please install the updated requirements."
+        ) from exc
+
+    return {
+        "A4": A4,
+        "colors": colors,
+        "getSampleStyleSheet": getSampleStyleSheet,
+        "ParagraphStyle": ParagraphStyle,
+        "SimpleDocTemplate": SimpleDocTemplate,
+        "Paragraph": Paragraph,
+        "Spacer": Spacer,
+        "Table": Table,
+        "TableStyle": TableStyle,
+        "ListFlowable": ListFlowable,
+        "ListItem": ListItem,
+        "inch": inch,
+    }
+
+
+def _safe_text(value: object) -> str:
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    return text if text else "-"
+
+
+def _build_pdf_story_helpers():
+    modules = _pdf_modules()
+    styles = modules["getSampleStyleSheet"]()
+    styles.add(
+        modules["ParagraphStyle"](
+            name="SectionHeading",
+            parent=styles["Heading2"],
+            fontSize=13,
+            leading=16,
+            spaceBefore=10,
+            spaceAfter=6,
+            textColor=modules["colors"].HexColor("#0f172a"),
+        )
+    )
+    styles.add(
+        modules["ParagraphStyle"](
+            name="SmallBody",
+            parent=styles["BodyText"],
+            fontSize=9,
+            leading=12,
+            textColor=modules["colors"].HexColor("#334155"),
+        )
+    )
+    return modules, styles
+
+
+def _kv_table(story: list, modules: dict, styles, items: list[tuple[str, object]]) -> None:
+    rows = [["Field", "Value"]]
+    for label, value in items:
+        rows.append(
+            [
+                modules["Paragraph"](f"<b>{label}</b>", styles["SmallBody"]),
+                modules["Paragraph"](_safe_text(value).replace("\n", "<br/>"), styles["SmallBody"]),
+            ]
+        )
+    table = modules["Table"](rows, colWidths=[1.9 * modules["inch"], 4.9 * modules["inch"]])
+    table.setStyle(
+        modules["TableStyle"](
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), modules["colors"].HexColor("#e2e8f0")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), modules["colors"].HexColor("#0f172a")),
+                ("GRID", (0, 0), (-1, -1), 0.5, modules["colors"].HexColor("#cbd5e1")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ]
+        )
+    )
+    story.append(table)
+    story.append(modules["Spacer"](1, 0.16 * modules["inch"]))
+
+
+def _bullet_list(story: list, modules: dict, styles, values: list[str]) -> None:
+    cleaned = [value.strip() for value in values if str(value).strip()]
+    if not cleaned:
+        story.append(modules["Paragraph"]("None", styles["SmallBody"]))
+        return
+    story.append(
+        modules["ListFlowable"](
+            [
+                modules["ListItem"](modules["Paragraph"](_safe_text(value), styles["SmallBody"]))
+                for value in cleaned
+            ],
+            bulletType="bullet",
+            start="circle",
+            leftIndent=16,
+        )
+    )
+
+
+def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) -> bytes:
+    modules, styles = _build_pdf_story_helpers()
+    buffer = io.BytesIO()
+    doc = modules["SimpleDocTemplate"](
+        buffer,
+        pagesize=modules["A4"],
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+        title=result.url,
+    )
+    story: list = []
+    story.append(modules["Paragraph"]("SEO Audit URL Report", styles["Title"]))
+    story.append(modules["Paragraph"](_safe_text(result.url), styles["SmallBody"]))
+    story.append(modules["Spacer"](1, 0.18 * modules["inch"]))
+
+    _kv_table(
+        story,
+        modules,
+        styles,
+        [
+            ("Site", site.domain),
+            ("HTTP Status", result.http_status),
+            ("Indexability", result.indexability_status),
+            ("Final URL", result.final_url),
+            ("Canonical", result.seo_meta.get("canonical_url", "")),
+            ("GSC Status", result.gsc_status),
+            ("Coverage State", result.gsc_coverage_state),
+            ("Last Crawl", result.gsc_last_crawl_time),
+            ("Word Count", result.word_count),
+            ("Word Count Source", result.word_count_source),
+            ("Heading Counts", f"H1:{result.heading_h1_count} H2:{result.heading_h2_count} H3:{result.heading_h3_count}"),
+            ("Feature Image Alt", result.feature_image_alt or result.feature_image_status),
+        ],
+    )
+
+    story.append(modules["Paragraph"]("Meta Tags", styles["SectionHeading"]))
+    _kv_table(
+        story,
+        modules,
+        styles,
+        sorted(result.seo_meta.items()) or [("Meta", "No meta fields captured")],
+    )
+
+    story.append(modules["Paragraph"]("Issues", styles["SectionHeading"]))
+    _bullet_list(story, modules, styles, result.issues)
+    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+
+    story.append(modules["Paragraph"]("Warnings", styles["SectionHeading"]))
+    _bullet_list(story, modules, styles, result.warnings)
+    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+
+    story.append(modules["Paragraph"]("Schema Types", styles["SectionHeading"]))
+    _bullet_list(story, modules, styles, result.jsonld_types)
+
+    doc.build(story)
+    return buffer.getvalue()
+
+
+def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> bytes:
+    modules, styles = _build_pdf_story_helpers()
+    buffer = io.BytesIO()
+    doc = modules["SimpleDocTemplate"](
+        buffer,
+        pagesize=modules["A4"],
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36,
+        title="SEO Audit Report",
+    )
+    story: list = []
+    story.append(modules["Paragraph"]("SEO Audit Report", styles["Title"]))
+    story.append(modules["Paragraph"](f"Generated: {_safe_text(report.generated_at)}", styles["SmallBody"]))
+    story.append(modules["Spacer"](1, 0.18 * modules["inch"]))
+
+    _kv_table(
+        story,
+        modules,
+        styles,
+        [
+            ("Overall Score", f"{summary.get('score', 0)}/100 ({summary.get('grade', '-')})"),
+            ("SEO Score", f"{summary.get('seo_score', 0)}/100 ({summary.get('seo_grade', '-')})"),
+            ("Schema Score", f"{summary.get('schema_score', 0)}/100 ({summary.get('schema_grade', '-')})"),
+            ("Meta Coverage", f"{summary.get('meta_coverage_pct', 0)}%"),
+            ("URLs Tested", sum(len(site.urls) for site in report.sites)),
+            ("Sites Audited", len(report.sites)),
+        ],
+    )
+
+    story.append(modules["Paragraph"]("Highlights", styles["SectionHeading"]))
+    _bullet_list(story, modules, styles, [str(item) for item in summary.get("highlights", [])])
+    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+
+    story.append(modules["Paragraph"]("Top Fixes", styles["SectionHeading"]))
+    fixes = [f"{message} ({count})" for message, count in summary.get("top_fixes", [])]
+    _bullet_list(story, modules, styles, fixes)
+    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+
+    for site in report.sites:
+        story.append(modules["Paragraph"](f"Site: {site.domain}", styles["SectionHeading"]))
+        _kv_table(
+            story,
+            modules,
+            styles,
+            [
+                ("Robots URL", site.robots_url),
+                ("Robots Status", site.robots_status),
+                ("Robots Error", site.robots_error),
+                ("Sitemaps Checked", len(site.sitemaps)),
+                ("URLs Audited", len(site.urls)),
+            ],
+        )
+        for result in site.urls:
+            story.append(modules["Paragraph"](_safe_text(result.url), styles["Heading3"]))
+            _kv_table(
+                story,
+                modules,
+                styles,
+                [
+                    ("HTTP Status", result.http_status),
+                    ("Indexability", result.indexability_status),
+                    ("GSC Status", result.gsc_status),
+                    ("Word Count", result.word_count),
+                    ("Headings", f"H1:{result.heading_h1_count} H2:{result.heading_h2_count} H3:{result.heading_h3_count}"),
+                    ("Feature Image Alt", result.feature_image_alt or result.feature_image_status),
+                    ("Schema Types", ", ".join(result.jsonld_types) if result.jsonld_types else "-"),
+                ],
+            )
+
+    doc.build(story)
+    return buffer.getvalue()
 
 
 st.set_page_config(page_title="Schema & Sitemap Validator", layout="wide")
@@ -450,20 +906,12 @@ div[data-testid="stMetric"] * {
     unsafe_allow_html=True,
 )
 
-st.markdown(
-    """
-<div class="header-bar">
-  <div class="header-title">Schema & Sitemap Validator</div>
-  <div class="header-sub">One run, full SEO audit with schema + sitemap insights.</div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
 schemaorg_ref_path = str(validator.DEFAULT_SCHEMAORG_REF_PATH)
 schemaorg_data_path = str(validator.DEFAULT_SCHEMAORG_DATA_PATH)
 rules_path = str(validator.DEFAULT_RULES_PATH)
 gsc_json_path = resolve_gsc_json_path()
+login_spreadsheet_id = resolve_login_spreadsheet_id()
+login_worksheet_name = resolve_login_worksheet_name()
 gsc_cache_path = resolve_gsc_cache_path()
 gsc_cache_ttl_hours = validator.DEFAULT_GSC_CACHE_TTL_HOURS
 user_agent = validator.DEFAULT_USER_AGENT
@@ -480,6 +928,17 @@ if "latest_run_requested_gsc" not in st.session_state:
     st.session_state["latest_run_requested_gsc"] = False
 if "active_url_detail" not in st.session_state:
     st.session_state["active_url_detail"] = ""
+if "logged_in_username" not in st.session_state:
+    st.session_state["logged_in_username"] = ""
+if "logged_in_at" not in st.session_state:
+    st.session_state["logged_in_at"] = ""
+
+logged_in_username, logged_in_at = require_login(
+    gsc_json_path,
+    login_spreadsheet_id,
+    login_worksheet_name,
+)
+render_app_header(logged_in_username)
 
 
 def run_validation_audit(
@@ -627,7 +1086,7 @@ def render_gsc_action_table(report: validator.Report) -> None:
         st.info("No URLs match the selected GSC filter.")
         return
 
-    header_cols = st.columns([1.3, 4.8, 0.7, 1.2, 1.2, 1.8, 1.8, 1.4], gap="small")
+    header_cols = st.columns([1.2, 4.3, 0.7, 1.2, 1.2, 1.5, 1.5, 1.2, 1.2], gap="small")
     header_labels = [
         "Site",
         "URL",
@@ -636,16 +1095,18 @@ def render_gsc_action_table(report: validator.Report) -> None:
         "GSC Status",
         "Coverage State",
         "Indexing State",
-        "Action",
+        "GSC",
+        "PDF",
     ]
     for column, label in zip(header_cols, header_labels):
         column.markdown(f"**{label}**")
 
     for row in filtered_rows:
+        site = row["Site Report"]
         result = row["Result"]
         row_key = str(row["Row Key"])
         button_label = "Refresh GSC" if (result.gsc_status or result.gsc_error) else "Fetch GSC"
-        cols = st.columns([1.3, 4.8, 0.7, 1.2, 1.2, 1.8, 1.8, 1.4], gap="small")
+        cols = st.columns([1.2, 4.3, 0.7, 1.2, 1.2, 1.5, 1.5, 1.2, 1.2], gap="small")
         cols[0].write(str(row["Site"]))
         cols[1].markdown(f"[{result.url}]({result.url})")
         cols[2].write(str(row["HTTP"]))
@@ -659,6 +1120,18 @@ def render_gsc_action_table(report: validator.Report) -> None:
                 st.rerun()
         else:
             cols[7].button("GSC Off", key=f"gsc_table_{row_key}", use_container_width=True, disabled=True)
+        try:
+            url_pdf = build_url_pdf(site, result)
+            cols[8].download_button(
+                "PDF",
+                data=url_pdf,
+                file_name=f"url-audit-{site.domain}-{row_key.split('::')[-1]}.pdf",
+                mime="application/pdf",
+                key=f"url_pdf_{row_key}",
+                use_container_width=True,
+            )
+        except Exception:
+            cols[8].button("PDF Off", key=f"url_pdf_off_{row_key}", use_container_width=True, disabled=True)
         st.divider()
 
 with st.form("run_form"):
@@ -751,6 +1224,31 @@ if current_report and current_summary:
     row3[1].metric("Blocked", summary.get("blocked_urls", 0))
     row3[2].metric("Uncertain", summary.get("uncertain_urls", 0))
     row3[3].metric("Redirected", summary.get("redirected_urls", 0))
+
+    report_download_col, preview_hint_col = st.columns([1.4, 2.2])
+    with report_download_col:
+        try:
+            report_pdf = build_report_pdf(current_report, summary)
+            st.download_button(
+                "Download Full Report (PDF)",
+                data=report_pdf,
+                file_name=f"seo-audit-report-{datetime.now(IST).strftime('%Y%m%d-%H%M%S')}.pdf",
+                mime="application/pdf",
+                key="download_full_report_pdf",
+                use_container_width=True,
+            )
+        except Exception:
+            st.button(
+                "Download Full Report (PDF)",
+                key="download_full_report_pdf_disabled",
+                use_container_width=True,
+                disabled=True,
+            )
+    with preview_hint_col:
+        st.caption(
+            "Use the PDF buttons in the URL table to download an individual URL audit. "
+            "If PDF buttons are disabled, install the updated requirements."
+        )
 
     gsc_rows = build_gsc_rows(current_report)
     if current_report.gsc_enabled:
