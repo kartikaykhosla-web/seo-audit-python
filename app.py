@@ -11,6 +11,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 import validator
