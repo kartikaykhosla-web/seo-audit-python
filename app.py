@@ -555,6 +555,129 @@ def _meta_snapshot_rows(result: validator.UrlCheckResult) -> list[tuple[str, obj
     return rows
 
 
+def _sitemap_snapshot_rows(site: validator.SiteReport) -> list[tuple[str, object]]:
+    rows: list[tuple[str, object]] = []
+    for index, sitemap in enumerate(site.sitemaps, start=1):
+        status = sitemap.status_code if sitemap.status_code is not None else "-"
+        seo_checks: list[str] = []
+        if sitemap.urls_found:
+            seo_checks.append(f"entries: {sitemap.urls_found}")
+        if sitemap.changefreq_missing:
+            seo_checks.append(f"changefreq missing: {sitemap.changefreq_missing}")
+        if sitemap.lastmod_stale:
+            seo_checks.append(f"stale lastmod: {sitemap.lastmod_stale}")
+        if sitemap.news_entries:
+            seo_checks.append(f"news entries: {sitemap.news_entries}")
+        summary = f"Status {status}"
+        if sitemap.kind:
+            summary += f" | Type {sitemap.kind}"
+        if seo_checks:
+            summary += " | " + " | ".join(seo_checks)
+        if sitemap.error:
+            summary += f" | Error: {sitemap.error}"
+        rows.append((f"Sitemap {index}", f"{sitemap.url}\n{summary}"))
+    return rows
+
+
+def _url_findings(result: validator.UrlCheckResult) -> tuple[list[str], list[str]]:
+    issue_items = list(result.issues) + list(result.seo_issues)
+    warning_items = list(result.warnings) + list(result.seo_warnings)
+    deduped_issues: list[str] = []
+    deduped_warnings: list[str] = []
+    seen_issues: set[str] = set()
+    seen_warnings: set[str] = set()
+    for item in issue_items:
+        cleaned = str(item).strip()
+        if cleaned and cleaned not in seen_issues:
+            seen_issues.add(cleaned)
+            deduped_issues.append(cleaned)
+    for item in warning_items:
+        cleaned = str(item).strip()
+        if cleaned and cleaned not in seen_warnings:
+            seen_warnings.add(cleaned)
+            deduped_warnings.append(cleaned)
+    return deduped_issues, deduped_warnings
+
+
+def _append_url_report_sections(
+    story: list,
+    modules: dict,
+    styles,
+    site: validator.SiteReport,
+    result: validator.UrlCheckResult,
+    *,
+    heading: str,
+    intro: str,
+) -> None:
+    issues, warnings = _url_findings(result)
+    _pdf_section_title(story, modules, styles, heading, intro)
+    _kv_table(
+        story,
+        modules,
+        styles,
+        [
+            ("Site", site.domain),
+            ("URL", result.url),
+            ("HTTP Status", result.http_status),
+            ("Indexability", result.indexability_status),
+            ("Indexability Reasons", " | ".join(result.indexability_reasons) if result.indexability_reasons else "-"),
+            ("Final URL", result.final_url),
+            ("Canonical", result.seo_meta.get("canonical_url", "")),
+            ("GSC Status", result.gsc_status),
+            ("Coverage State", result.gsc_coverage_state),
+            ("Page Fetch State", result.gsc_page_fetch_state),
+            ("Robots State", result.gsc_robots_state),
+            ("Last Crawl", result.gsc_last_crawl_time),
+            ("Content Summary", _content_summary_text(result)),
+            ("Feature Image Alt", result.feature_image_alt or result.feature_image_status),
+            ("Schema Types", ", ".join(result.jsonld_types) if result.jsonld_types else "-"),
+        ],
+    )
+
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "On-Page Metadata",
+        "These are the most important on-page SEO fields captured for this URL.",
+    )
+    _kv_table(
+        story,
+        modules,
+        styles,
+        _meta_snapshot_rows(result) or [("Meta", "No meta fields captured")],
+    )
+
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Issues",
+        "These are the key blockers or implementation gaps found for this URL.",
+    )
+    _bullet_list(story, modules, styles, issues)
+    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Warnings",
+        "Warnings are lower-severity issues or optimisation opportunities for this URL.",
+    )
+    _bullet_list(story, modules, styles, warnings)
+    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Recommended Actions",
+        "Use these recommended actions to guide implementation or editorial fixes for this page.",
+    )
+    _bullet_list(story, modules, styles, _recommendations_for_result(result))
+
+
 def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) -> bytes:
     modules, styles = _build_pdf_story_helpers()
     buffer = io.BytesIO()
@@ -577,87 +700,15 @@ def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) 
     )
     story.append(modules["Paragraph"](_safe_text(result.url), styles["SmallBody"]))
     story.append(modules["Spacer"](1, 0.18 * modules["inch"]))
-
-    _pdf_section_title(
+    _append_url_report_sections(
         story,
         modules,
         styles,
-        "Executive Snapshot",
-        "This section gives a quick overview of how the page is performing at a glance.",
+        site,
+        result,
+        heading="Executive Snapshot",
+        intro="This section gives a complete overview of how this page is performing across crawlability, metadata, and structured data.",
     )
-    _kv_table(
-        story,
-        modules,
-        styles,
-        [
-            ("Site", site.domain),
-            ("HTTP Status", result.http_status),
-            ("Indexability", result.indexability_status),
-            ("Indexability Reasons", " | ".join(result.indexability_reasons) if result.indexability_reasons else "-"),
-            ("Final URL", result.final_url),
-            ("Canonical", result.seo_meta.get("canonical_url", "")),
-            ("GSC Status", result.gsc_status),
-            ("Coverage State", result.gsc_coverage_state),
-            ("Page Fetch State", result.gsc_page_fetch_state),
-            ("Robots State", result.gsc_robots_state),
-            ("Last Crawl", result.gsc_last_crawl_time),
-            ("Content Summary", _content_summary_text(result)),
-            ("Feature Image Alt", result.feature_image_alt or result.feature_image_status),
-        ],
-    )
-
-    _pdf_section_title(
-        story,
-        modules,
-        styles,
-        "On-Page Metadata",
-        "These are the key SEO-facing meta fields captured from the page.",
-    )
-    _kv_table(
-        story,
-        modules,
-        styles,
-        _meta_snapshot_rows(result) or [("Meta", "No meta fields captured")],
-    )
-
-    _pdf_section_title(
-        story,
-        modules,
-        styles,
-        "Issues",
-        "These are the strongest blockers or implementation gaps found for the page.",
-    )
-    _bullet_list(story, modules, styles, result.issues)
-    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
-
-    _pdf_section_title(
-        story,
-        modules,
-        styles,
-        "Warnings",
-        "Warnings are lower-severity issues or optimisation opportunities.",
-    )
-    _bullet_list(story, modules, styles, result.warnings)
-    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
-
-    _pdf_section_title(
-        story,
-        modules,
-        styles,
-        "Structured Data Snapshot",
-        "A summary of JSON-LD/schema types found on the page.",
-    )
-    _bullet_list(story, modules, styles, result.jsonld_types)
-
-    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
-    _pdf_section_title(
-        story,
-        modules,
-        styles,
-        "Recommended Actions",
-        "Use these points as the next fixes to improve indexability and SEO quality for this URL.",
-    )
-    _bullet_list(story, modules, styles, _recommendations_for_result(result))
 
     doc.build(story)
     return buffer.getvalue()
@@ -748,27 +799,52 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
                 ("URLs Audited", len(site.urls)),
             ],
         )
-        for result_index, result in enumerate(site.urls):
-            story.append(modules["Paragraph"](_safe_text(result.url), styles["Heading3"]))
+        if site.notes:
+            _pdf_section_title(
+                story,
+                modules,
+                styles,
+                "Site Notes",
+                "Run-level site notes captured during discovery and validation.",
+            )
+            _bullet_list(story, modules, styles, site.notes)
+            story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+        if site.sitemaps:
+            _pdf_section_title(
+                story,
+                modules,
+                styles,
+                "Sitemap Snapshot",
+                "This is a compact view of the sitemap files checked for this site and the important observations recorded against them.",
+            )
             _kv_table(
                 story,
                 modules,
                 styles,
-                [
-                    ("HTTP Status", result.http_status),
-                    ("Indexability", result.indexability_status),
-                    ("GSC Status", result.gsc_status),
-                    ("Coverage State", result.gsc_coverage_state),
-                    ("Content Summary", _content_summary_text(result)),
-                    ("Feature Image Alt", result.feature_image_alt or result.feature_image_status),
-                    ("Schema Types", ", ".join(result.jsonld_types) if result.jsonld_types else "-"),
-                    ("Key Findings", " | ".join(_recommendations_for_result(result)[:3]) or "-"),
-                ],
+                _sitemap_snapshot_rows(site),
             )
-            if result_index < len(site.urls) - 1:
-                story.append(modules["Spacer"](1, 0.08 * modules["inch"]))
-        if site_index < len(report.sites) - 1:
-            story.append(modules["PageBreak"]())
+        story.append(modules["PageBreak"]())
+
+        for result_index, result in enumerate(site.urls):
+            story.append(modules["Paragraph"]("URL Detail", styles["SectionHeading"]))
+            story.append(modules["Paragraph"](_safe_text(result.url), styles["Heading3"]))
+            story.append(
+                modules["Paragraph"](
+                    "This page mirrors the detailed audit view so the exported PDF can be shared independently with editorial, product, or engineering teams.",
+                    styles["LeadBody"],
+                )
+            )
+            _append_url_report_sections(
+                story,
+                modules,
+                styles,
+                site,
+                result,
+                heading="Page Audit Summary",
+                intro="The sections below capture the same core findings shown in the app for this audited URL.",
+            )
+            if result_index < len(site.urls) - 1 or site_index < len(report.sites) - 1:
+                story.append(modules["PageBreak"]())
 
     doc.build(story)
     return buffer.getvalue()
