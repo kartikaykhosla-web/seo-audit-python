@@ -1535,6 +1535,20 @@ def _meta_table_html(result: validator.UrlCheckResult) -> str:
     return f"<div class='table-wrap'><table>{rows}</table></div>"
 
 
+def _live_kv_table_html(items: list[tuple[str, object]]) -> str:
+    if not items:
+        return "<div class='muted'>No details available.</div>"
+    rows = "".join(
+        f"<tr><th>{_html_safe(label)}</th><td>{_html_safe(value)}</td></tr>"
+        for label, value in items
+    )
+    return (
+        "<div class='audit-detail-table-wrap'>"
+        f"<table class='audit-detail-table'>{rows}</table>"
+        "</div>"
+    )
+
+
 def _schema_object_html(title: str, obj: dict[str, str], fields: list[str]) -> str:
     return (
         "<div class='schema-card'>"
@@ -2193,6 +2207,39 @@ div[data-testid="stMetric"] * {
   color: #475569 !important;
   opacity: 1 !important;
 }
+.audit-detail-table-wrap {
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  background: #ffffff;
+}
+.audit-detail-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.audit-detail-table th,
+.audit-detail-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid #e5e7eb;
+  text-align: left;
+  vertical-align: top;
+  font-size: 13px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+.audit-detail-table tr:last-child th,
+.audit-detail-table tr:last-child td {
+  border-bottom: none;
+}
+.audit-detail-table th {
+  width: 220px;
+  background: #f8fafc;
+  color: #334155;
+  font-weight: 700;
+}
+.audit-detail-spacer {
+  height: 0.35rem;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -2442,8 +2489,7 @@ def render_url_detail_section(rows: list[dict[str, object]]) -> None:
         row_key = str(row["Row Key"])
         expander_label = result.url
         with st.expander(expander_label, expanded=False):
-            header_cols = st.columns([5, 1], gap="small")
-            overview_rows = [
+            snapshot_rows = [
                 ("Site", site.domain),
                 ("HTTP", row["HTTP"]),
                 ("Indexability", result.indexability_status or "-"),
@@ -2452,9 +2498,10 @@ def render_url_detail_section(rows: list[dict[str, object]]) -> None:
                 ("Last Crawl", result.gsc_last_crawl_time or "-"),
                 ("Content", _content_summary_text(result)),
             ]
+            header_cols = st.columns([5, 1], gap="small")
             with header_cols[0]:
                 st.markdown("**Audit Snapshot**")
-                st.table(pd.DataFrame(overview_rows, columns=["Field", "Value"]))
+                st.markdown(_live_kv_table_html(snapshot_rows), unsafe_allow_html=True)
             try:
                 url_pdf = build_url_pdf(site, result)
                 header_cols[1].download_button(
@@ -2476,7 +2523,7 @@ def render_url_detail_section(rows: list[dict[str, object]]) -> None:
             meta_rows = _meta_snapshot_rows(result)
             if meta_rows:
                 st.markdown("**Metadata Snapshot**")
-                st.table(pd.DataFrame(meta_rows, columns=["Field", "Value"]))
+                st.markdown(_live_kv_table_html(meta_rows), unsafe_allow_html=True)
 
             findings_col1, findings_col2 = st.columns(2, gap="large")
             with findings_col1:
