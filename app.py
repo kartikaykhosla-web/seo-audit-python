@@ -10,6 +10,7 @@ import re
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from xml.sax.saxutils import escape as xml_escape
 
 import pandas as pd
 import streamlit as st
@@ -21,6 +22,9 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = APP_DIR / "report.html"
 DEFAULT_DEPLOYED_GSC_JSON = Path(tempfile.gettempdir()) / "schema-validator-gsc-service-account.json"
 DEFAULT_DEPLOYED_GSC_CACHE = Path(tempfile.gettempdir()) / "schema-validator-gsc-cache.json"
+DEFAULT_PDF_FONT_PATH = APP_DIR / "assets" / "fonts" / "GotuDevanagari-Regular.ttf"
+DEFAULT_PDF_FONT_NAME = "AuditUnicode"
+DEFAULT_PDF_FONT_BOLD_NAME = "AuditUnicodeBold"
 IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_LOGIN_SPREADSHEET_ID = "1-wGQoVKu0GqcsHJDT0pCIakEO-bIdXhzmV5ydn4kkNw"
 DEFAULT_LOGIN_WORKSHEET_NAME = "seo audit tool login"
@@ -189,6 +193,8 @@ def resolve_login_spreadsheet_id() -> str:
 def resolve_login_worksheet_name() -> str:
     if "seo_audit_login_worksheet_name" in st.secrets:
         return str(st.secrets["seo_audit_login_worksheet_name"]).strip()
+    if "login_history_worksheet_name" in st.secrets:
+        return str(st.secrets["login_history_worksheet_name"]).strip()
     env_value = os.environ.get("SEO_AUDIT_LOGIN_WORKSHEET_NAME", "").strip()
     if env_value:
         return env_value
@@ -201,6 +207,10 @@ def resolve_login_service_account_json_path() -> str:
         secret_candidates.append(st.secrets["seo_audit_login_service_account"])
     if "seo_audit_login_service_account_json" in st.secrets:
         secret_candidates.append(st.secrets["seo_audit_login_service_account_json"])
+    if "gsc_service_account" in st.secrets:
+        secret_candidates.append(st.secrets["gsc_service_account"])
+    if "gsc_service_account_json" in st.secrets:
+        secret_candidates.append(st.secrets["gsc_service_account_json"])
 
     env_json = os.environ.get("SEO_AUDIT_LOGIN_SERVICE_ACCOUNT_JSON", "").strip()
     if env_json:
@@ -310,8 +320,13 @@ def append_login_history_row(
     username: str,
     logged_in_at: str,
 ) -> None:
-    if not service_account_json_path or not spreadsheet_id:
-        return
+    if not service_account_json_path:
+        raise RuntimeError("Login sheet sync skipped: no usable service-account JSON was resolved.")
+    if not spreadsheet_id:
+        raise RuntimeError("Login sheet sync skipped: no spreadsheet ID was resolved.")
+    print(
+        f"[seo-audit-login] writing login row | spreadsheet_id={spreadsheet_id} | worksheet={worksheet_name} | credentials={service_account_json_path}"
+    )
     sheets_service = build_sheets_service(service_account_json_path)
     ensure_login_sheet(sheets_service, spreadsheet_id, worksheet_name)
     existing_rows = (
@@ -329,15 +344,17 @@ def append_login_history_row(
             row[2] if len(row) > 2 else "",
         ]
         if candidate == target_row:
+            print("[seo-audit-login] duplicate login row detected; skipping append")
             return
     row = [target_row]
-    sheets_service.spreadsheets().values().append(
+    response = sheets_service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=sheet_range(worksheet_name, "A1"),
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": row},
     ).execute()
+    print(f"[seo-audit-login] append complete | updates={response.get('updates', {})}")
 
 
 def friendly_login_sheet_error(raw_error: str) -> str:
@@ -437,6 +454,8 @@ def _pdf_modules():
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import inch
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.platypus import (
             ListFlowable,
             ListItem,
@@ -466,6 +485,8 @@ def _pdf_modules():
         "ListItem": ListItem,
         "PageBreak": PageBreak,
         "inch": inch,
+        "pdfmetrics": pdfmetrics,
+        "TTFont": TTFont,
     }
 
 
@@ -476,14 +497,50 @@ def _safe_text(value: object) -> str:
     return text if text else "-"
 
 
+def _resolve_pdf_font_path() -> Path | None:
+    candidates = [
+        DEFAULT_PDF_FONT_PATH,
+        Path("/System/Library/AssetsV2/com_apple_MobileAsset_Font7/3c0538e5098b7ae593a24c89e80fd5949e873ce1.asset/AssetData/GotuDevanagari-Regular.ttf"),
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _register_pdf_fonts(modules: dict) -> dict[str, str]:
+    pdfmetrics = modules["pdfmetrics"]
+    TTFont = modules["TTFont"]
+    font_path = _resolve_pdf_font_path()
+    if not font_path:
+        return {"regular": "Helvetica", "bold": "Helvetica-Bold"}
+
+    registered = set(pdfmetrics.getRegisteredFontNames())
+    if DEFAULT_PDF_FONT_NAME not in registered:
+        pdfmetrics.registerFont(TTFont(DEFAULT_PDF_FONT_NAME, str(font_path)))
+    if DEFAULT_PDF_FONT_BOLD_NAME not in registered:
+        pdfmetrics.registerFont(TTFont(DEFAULT_PDF_FONT_BOLD_NAME, str(font_path)))
+    return {"regular": DEFAULT_PDF_FONT_NAME, "bold": DEFAULT_PDF_FONT_BOLD_NAME}
+
+
+def _pdf_paragraph_text(value: object) -> str:
+    text = _safe_text(value)
+    text = xml_escape(text)
+    return text.replace("\n", "<br/>")
+
+
 def _build_pdf_story_helpers():
     modules = _pdf_modules()
+    fonts = _register_pdf_fonts(modules)
     styles = modules["getSampleStyleSheet"]()
-    styles["Title"].fontName = "Helvetica-Bold"
+    styles["Normal"].fontName = fonts["regular"]
+    styles["BodyText"].fontName = fonts["regular"]
+    styles["Title"].fontName = fonts["bold"]
     styles["Title"].fontSize = 22
     styles["Title"].leading = 26
     styles["Title"].textColor = modules["colors"].HexColor("#0f172a")
-    styles["Heading3"].fontName = "Helvetica-Bold"
+    styles["Heading2"].fontName = fonts["bold"]
+    styles["Heading3"].fontName = fonts["bold"]
     styles["Heading3"].fontSize = 11
     styles["Heading3"].leading = 14
     styles["Heading3"].spaceBefore = 8
@@ -492,6 +549,7 @@ def _build_pdf_story_helpers():
         modules["ParagraphStyle"](
             name="SectionHeading",
             parent=styles["Heading2"],
+            fontName=fonts["bold"],
             fontSize=13,
             leading=16,
             spaceBefore=10,
@@ -503,6 +561,7 @@ def _build_pdf_story_helpers():
         modules["ParagraphStyle"](
             name="LeadBody",
             parent=styles["BodyText"],
+            fontName=fonts["regular"],
             fontSize=10,
             leading=14,
             textColor=modules["colors"].HexColor("#475569"),
@@ -513,30 +572,51 @@ def _build_pdf_story_helpers():
         modules["ParagraphStyle"](
             name="SmallBody",
             parent=styles["BodyText"],
+            fontName=fonts["regular"],
             fontSize=9,
             leading=12,
             textColor=modules["colors"].HexColor("#334155"),
+        )
+    )
+    styles.add(
+        modules["ParagraphStyle"](
+            name="LabelBody",
+            parent=styles["BodyText"],
+            fontName=fonts["bold"],
+            fontSize=9,
+            leading=12,
+            textColor=modules["colors"].HexColor("#0f172a"),
+            spaceAfter=2,
         )
     )
     return modules, styles
 
 
 def _pdf_section_title(story: list, modules: dict, styles, title: str, intro: str = "") -> None:
-    story.append(modules["Paragraph"](title, styles["SectionHeading"]))
+    story.append(modules["Paragraph"](_pdf_paragraph_text(title), styles["SectionHeading"]))
     if intro:
-        story.append(modules["Paragraph"](intro, styles["LeadBody"]))
+        story.append(modules["Paragraph"](_pdf_paragraph_text(intro), styles["LeadBody"]))
 
 
 def _kv_table(story: list, modules: dict, styles, items: list[tuple[str, object]]) -> None:
-    rows = [["Field", "Value"]]
+    rows = [
+        [
+            modules["Paragraph"]("<b>Field</b>", styles["LabelBody"]),
+            modules["Paragraph"]("<b>Value</b>", styles["LabelBody"]),
+        ]
+    ]
     for label, value in items:
         rows.append(
             [
-                modules["Paragraph"](f"<b>{label}</b>", styles["SmallBody"]),
-                modules["Paragraph"](_safe_text(value).replace("\n", "<br/>"), styles["SmallBody"]),
+                modules["Paragraph"](_pdf_paragraph_text(label), styles["LabelBody"]),
+                modules["Paragraph"](_pdf_paragraph_text(value), styles["SmallBody"]),
             ]
         )
-    table = modules["Table"](rows, colWidths=[1.9 * modules["inch"], 4.9 * modules["inch"]])
+    table = modules["Table"](
+        rows,
+        colWidths=[1.75 * modules["inch"], 5.05 * modules["inch"]],
+        repeatRows=1,
+    )
     table.setStyle(
         modules["TableStyle"](
             [
@@ -548,10 +628,26 @@ def _kv_table(story: list, modules: dict, styles, items: list[tuple[str, object]
                 ("RIGHTPADDING", (0, 0), (-1, -1), 6),
                 ("TOPPADDING", (0, 0), (-1, -1), 5),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [
+                    modules["colors"].white,
+                    modules["colors"].HexColor("#f8fafc"),
+                ]),
             ]
         )
     )
     story.append(table)
+    story.append(modules["Spacer"](1, 0.16 * modules["inch"]))
+
+
+def _detail_blocks(story: list, modules: dict, styles, items: list[tuple[str, object]]) -> None:
+    if not items:
+        story.append(modules["Paragraph"]("No detail available.", styles["SmallBody"]))
+        return
+    for index, (label, value) in enumerate(items):
+        if index:
+            story.append(modules["Spacer"](1, 0.06 * modules["inch"]))
+        story.append(modules["Paragraph"](_pdf_paragraph_text(label), styles["LabelBody"]))
+        story.append(modules["Paragraph"](_pdf_paragraph_text(value), styles["SmallBody"]))
     story.append(modules["Spacer"](1, 0.16 * modules["inch"]))
 
 
@@ -563,7 +659,7 @@ def _bullet_list(story: list, modules: dict, styles, values: list[str]) -> None:
     story.append(
         modules["ListFlowable"](
             [
-                modules["ListItem"](modules["Paragraph"](_safe_text(value), styles["SmallBody"]))
+                modules["ListItem"](modules["Paragraph"](_pdf_paragraph_text(value), styles["SmallBody"]))
                 for value in cleaned
             ],
             bulletType="bullet",
@@ -711,7 +807,7 @@ def _append_url_report_sections(
         "On-Page Metadata",
         "These are the most important on-page SEO fields captured for this URL.",
     )
-    _kv_table(
+    _detail_blocks(
         story,
         modules,
         styles,
@@ -764,11 +860,13 @@ def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) 
     story.append(modules["Paragraph"]("SEO Audit URL Report", styles["Title"]))
     story.append(
         modules["Paragraph"](
-            "A focused audit for one URL covering crawlability, on-page SEO, structured data, and GSC status.",
+            _pdf_paragraph_text(
+                "A focused audit for one URL covering crawlability, on-page SEO, structured data, and GSC status."
+            ),
             styles["LeadBody"],
         )
     )
-    story.append(modules["Paragraph"](_safe_text(result.url), styles["SmallBody"]))
+    story.append(modules["Paragraph"](_pdf_paragraph_text(result.url), styles["SmallBody"]))
     story.append(modules["Spacer"](1, 0.18 * modules["inch"]))
     _append_url_report_sections(
         story,
@@ -800,11 +898,18 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
     story.append(modules["Paragraph"]("SEO Audit Report", styles["Title"]))
     story.append(
         modules["Paragraph"](
-            "A consolidated report covering technical SEO, metadata, schema, sitemap quality, and GSC findings.",
+            _pdf_paragraph_text(
+                "A consolidated report covering technical SEO, metadata, schema, sitemap quality, and GSC findings."
+            ),
             styles["LeadBody"],
         )
     )
-    story.append(modules["Paragraph"](f"Generated: {_safe_text(report.generated_at)}", styles["SmallBody"]))
+    story.append(
+        modules["Paragraph"](
+            _pdf_paragraph_text(f"Generated: {_safe_text(report.generated_at)}"),
+            styles["SmallBody"],
+        )
+    )
     story.append(modules["Spacer"](1, 0.18 * modules["inch"]))
 
     _pdf_section_title(
@@ -897,10 +1002,12 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
 
         for result_index, result in enumerate(site.urls):
             story.append(modules["Paragraph"]("URL Detail", styles["SectionHeading"]))
-            story.append(modules["Paragraph"](_safe_text(result.url), styles["Heading3"]))
+            story.append(modules["Paragraph"](_pdf_paragraph_text(result.url), styles["Heading3"]))
             story.append(
                 modules["Paragraph"](
-                    "This page mirrors the detailed audit view so the exported PDF can be shared independently with editorial, product, or engineering teams.",
+                    _pdf_paragraph_text(
+                        "This page mirrors the detailed audit view so the exported PDF can be shared independently with editorial, product, or engineering teams."
+                    ),
                     styles["LeadBody"],
                 )
             )
