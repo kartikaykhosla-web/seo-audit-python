@@ -176,6 +176,8 @@ def iter_report_urls(
 
 
 def resolve_login_spreadsheet_id() -> str:
+    if "seo_audit_login_spreadsheet_id" in st.secrets:
+        return str(st.secrets["seo_audit_login_spreadsheet_id"]).strip()
     if "login_history_spreadsheet_id" in st.secrets:
         return str(st.secrets["login_history_spreadsheet_id"]).strip()
     env_value = os.environ.get("SEO_AUDIT_LOGIN_SPREADSHEET_ID", "").strip()
@@ -185,12 +187,42 @@ def resolve_login_spreadsheet_id() -> str:
 
 
 def resolve_login_worksheet_name() -> str:
-    if "login_history_worksheet_name" in st.secrets:
-        return str(st.secrets["login_history_worksheet_name"]).strip()
+    if "seo_audit_login_worksheet_name" in st.secrets:
+        return str(st.secrets["seo_audit_login_worksheet_name"]).strip()
     env_value = os.environ.get("SEO_AUDIT_LOGIN_WORKSHEET_NAME", "").strip()
     if env_value:
         return env_value
     return DEFAULT_LOGIN_WORKSHEET_NAME
+
+
+def resolve_login_service_account_json_path() -> str:
+    secret_candidates = []
+    if "seo_audit_login_service_account" in st.secrets:
+        secret_candidates.append(st.secrets["seo_audit_login_service_account"])
+    if "seo_audit_login_service_account_json" in st.secrets:
+        secret_candidates.append(st.secrets["seo_audit_login_service_account_json"])
+
+    env_json = os.environ.get("SEO_AUDIT_LOGIN_SERVICE_ACCOUNT_JSON", "").strip()
+    if env_json:
+        secret_candidates.append(env_json)
+
+    for candidate in secret_candidates:
+        if not candidate:
+            continue
+        try:
+            if isinstance(candidate, str):
+                payload = json.loads(candidate)
+            else:
+                payload = dict(candidate)
+            DEFAULT_DEPLOYED_GSC_JSON.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            return str(DEFAULT_DEPLOYED_GSC_JSON)
+        except Exception:
+            continue
+
+    return resolve_gsc_json_path()
 
 
 def ist_now() -> datetime:
@@ -302,7 +334,21 @@ def friendly_login_sheet_error(raw_error: str) -> str:
 def require_login(service_account_json_path: str, spreadsheet_id: str, worksheet_name: str) -> tuple[str, str]:
     username = str(st.session_state.get("logged_in_username", "")).strip().lower()
     logged_in_at = str(st.session_state.get("logged_in_at", "")).strip()
+    login_sheet_synced = bool(st.session_state.get("login_sheet_synced", False))
     if username and logged_in_at:
+        if not login_sheet_synced:
+            try:
+                append_login_history_row(
+                    service_account_json_path,
+                    spreadsheet_id,
+                    worksheet_name,
+                    username,
+                    logged_in_at,
+                )
+                st.session_state["login_sheet_synced"] = True
+                st.session_state.pop("login_sheet_error", None)
+            except Exception as exc:
+                st.session_state["login_sheet_error"] = str(exc)
         return username, logged_in_at
 
     st.markdown(
@@ -326,6 +372,7 @@ def require_login(service_account_json_path: str, spreadsheet_id: str, worksheet
             logged_in_at = ist_now().isoformat()
             st.session_state["logged_in_username"] = normalized
             st.session_state["logged_in_at"] = logged_in_at
+            st.session_state["login_sheet_synced"] = False
             try:
                 append_login_history_row(
                     service_account_json_path,
@@ -334,6 +381,7 @@ def require_login(service_account_json_path: str, spreadsheet_id: str, worksheet
                     normalized,
                     logged_in_at,
                 )
+                st.session_state["login_sheet_synced"] = True
                 st.session_state.pop("login_sheet_error", None)
             except Exception as exc:
                 st.session_state["login_sheet_error"] = str(exc)
@@ -358,6 +406,7 @@ def render_app_header(username: str) -> None:
         if st.button("⎋", help=f"Log out ({username})", key="logout_icon_button", use_container_width=True):
             st.session_state.pop("logged_in_username", None)
             st.session_state.pop("logged_in_at", None)
+            st.session_state.pop("login_sheet_synced", None)
             st.rerun()
 
 
@@ -1162,6 +1211,7 @@ schemaorg_ref_path = str(validator.DEFAULT_SCHEMAORG_REF_PATH)
 schemaorg_data_path = str(validator.DEFAULT_SCHEMAORG_DATA_PATH)
 rules_path = str(validator.DEFAULT_RULES_PATH)
 gsc_json_path = resolve_gsc_json_path()
+login_service_account_json_path = resolve_login_service_account_json_path()
 login_spreadsheet_id = resolve_login_spreadsheet_id()
 login_worksheet_name = resolve_login_worksheet_name()
 gsc_cache_path = resolve_gsc_cache_path()
@@ -1186,7 +1236,7 @@ if "logged_in_at" not in st.session_state:
     st.session_state["logged_in_at"] = ""
 
 logged_in_username, logged_in_at = require_login(
-    gsc_json_path,
+    login_service_account_json_path,
     login_spreadsheet_id,
     login_worksheet_name,
 )
