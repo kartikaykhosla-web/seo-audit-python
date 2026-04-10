@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import html
 import io
 import json
 import os
@@ -14,6 +16,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 import pandas as pd
 import streamlit as st
+from PIL import Image
 
 import validator
 
@@ -1031,7 +1034,7 @@ def _append_url_report_sections(
     _append_schema_details_section(story, modules, styles, result)
 
 
-def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) -> bytes:
+def _build_url_pdf_reportlab(site: validator.SiteReport, result: validator.UrlCheckResult) -> bytes:
     modules, styles = _build_pdf_story_helpers()
     buffer = io.BytesIO()
     doc = modules["SimpleDocTemplate"](
@@ -1069,7 +1072,7 @@ def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) 
     return buffer.getvalue()
 
 
-def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> bytes:
+def _build_report_pdf_reportlab(report: validator.Report, summary: dict[str, object]) -> bytes:
     modules, styles = _build_pdf_story_helpers()
     buffer = io.BytesIO()
     doc = modules["SimpleDocTemplate"](
@@ -1212,6 +1215,675 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
 
     doc.build(story)
     return buffer.getvalue()
+
+
+def _html_safe(value: object) -> str:
+    text = _safe_text(value)
+    return html.escape(text).replace("\n", "<br>")
+
+
+def _font_data_uri() -> str:
+    font_path = _resolve_pdf_font_path()
+    if not font_path or not font_path.exists():
+        return ""
+    try:
+        encoded = base64.b64encode(font_path.read_bytes()).decode("ascii")
+        return f"data:font/ttf;base64,{encoded}"
+    except Exception:
+        return ""
+
+
+def _ui_snapshot_css() -> str:
+    font_uri = _font_data_uri()
+    font_face = ""
+    if font_uri:
+        font_face = (
+            "@font-face{font-family:'AuditPrint';"
+            f"src:url('{font_uri}') format('truetype');"
+            "font-weight:400;font-style:normal;font-display:swap;}"
+        )
+    return f"""
+{font_face}
+:root {{
+  --bg: #f3f4f6;
+  --surface: #ffffff;
+  --surface-soft: #f8fafc;
+  --text: #0f172a;
+  --muted: #475569;
+  --border: #e5e7eb;
+  --border-soft: #e2e8f0;
+  --shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+}}
+@page {{
+  size: A4;
+  margin: 14mm 10mm;
+}}
+html, body {{
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'AuditPrint', 'Noto Sans Devanagari', 'Nirmala UI', 'Segoe UI', sans-serif;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}}
+body {{
+  padding: 20px;
+}}
+.page {{
+  max-width: 1180px;
+  margin: 0 auto;
+}}
+.header-bar {{
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 18px 22px;
+  box-shadow: var(--shadow);
+  margin-bottom: 18px;
+}}
+.header-title {{
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.25;
+}}
+.header-sub {{
+  font-size: 13px;
+  color: var(--muted);
+}}
+.section {{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 18px 22px;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.06);
+  margin-bottom: 18px;
+}}
+.section-title {{
+  font-size: 14px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin: 0 0 6px 0;
+}}
+.section-copy {{
+  color: var(--muted);
+  font-size: 13px;
+  margin-bottom: 14px;
+}}
+.metrics {{
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}}
+.metrics.metrics-3 {{
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}}
+.metric-card {{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 6px 14px rgba(15, 23, 42, 0.05);
+}}
+.metric-label {{
+  color: var(--muted);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  margin-bottom: 4px;
+}}
+.metric-value {{
+  font-size: 26px;
+  font-weight: 700;
+}}
+.metric-sub {{
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 4px;
+}}
+.table-wrap {{
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+}}
+table {{
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+}}
+th, td {{
+  border-bottom: 1px solid var(--border-soft);
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+  font-size: 13px;
+  word-break: break-word;
+}}
+th {{
+  background: #f8fafc;
+  color: var(--muted);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-size: 11px;
+}}
+tr:last-child td {{
+  border-bottom: none;
+}}
+.muted {{
+  color: var(--muted);
+}}
+.accordion {{
+  background: var(--surface-soft);
+  border: 1px solid var(--border-soft);
+  border-radius: 14px;
+  margin: 12px 0;
+  overflow: hidden;
+}}
+.accordion > summary {{
+  list-style: none;
+  cursor: default;
+  padding: 14px 18px;
+  font-size: 18px;
+  font-weight: 700;
+}}
+.accordion > summary::-webkit-details-marker {{
+  display: none;
+}}
+.accordion > summary::before {{
+  content: "▾";
+  display: inline-block;
+  margin-right: 10px;
+  color: #1d4ed8;
+}}
+.accordion-body {{
+  padding: 0 18px 18px;
+}}
+.top-grid {{
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}}
+.summary-grid {{
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}}
+.info-card {{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+}}
+.info-label {{
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  font-weight: 700;
+  margin-bottom: 4px;
+}}
+.info-value {{
+  font-size: 14px;
+  line-height: 1.45;
+}}
+.split {{
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 14px;
+}}
+.subheading {{
+  font-size: 15px;
+  font-weight: 700;
+  margin: 16px 0 8px;
+}}
+.list {{
+  margin: 0;
+  padding-left: 18px;
+}}
+.list li {{
+  margin: 4px 0;
+  line-height: 1.45;
+}}
+.schema-section-title {{
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  margin: 18px 0 10px;
+}}
+.schema-card {{
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  margin-bottom: 12px;
+}}
+.schema-card-title {{
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 10px;
+}}
+.kv-table th {{
+  width: 220px;
+  background: #f8fafc;
+}}
+.site-heading {{
+  font-size: 18px;
+  font-weight: 700;
+  margin: 18px 0 10px;
+}}
+.pill {{
+  display: inline-block;
+  background: #eef2ff;
+  color: #3730a3;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  margin-right: 8px;
+}}
+.compact {{
+  font-size: 12px;
+}}
+"""
+
+
+def _metric_card_html(label: str, value: object, sub: object = "") -> str:
+    sub_html = f"<div class='metric-sub'>{_html_safe(sub)}</div>" if str(sub or "").strip() else ""
+    return (
+        "<div class='metric-card'>"
+        f"<div class='metric-label'>{_html_safe(label)}</div>"
+        f"<div class='metric-value'>{_html_safe(value)}</div>"
+        f"{sub_html}"
+        "</div>"
+    )
+
+
+def _kv_table_html(items: list[tuple[str, object]]) -> str:
+    rows = []
+    for label, value in items:
+        rows.append(f"<tr><th>{_html_safe(label)}</th><td>{_html_safe(value)}</td></tr>")
+    body = "".join(rows) if rows else "<tr><td class='muted'>No details available.</td></tr>"
+    return f"<div class='table-wrap'><table class='kv-table'>{body}</table></div>"
+
+
+def _list_html(values: list[str], empty_message: str = "None") -> str:
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
+    if not cleaned:
+        return f"<div class='muted'>{_html_safe(empty_message)}</div>"
+    return "<ul class='list'>" + "".join(f"<li>{_html_safe(value)}</li>" for value in cleaned) + "</ul>"
+
+
+def _meta_table_html(result: validator.UrlCheckResult) -> str:
+    meta_rows = _meta_snapshot_rows(result)
+    if not meta_rows:
+        return "<div class='muted'>No metadata fields captured.</div>"
+    rows = "".join(
+        f"<tr><th>{_html_safe(field)}</th><td>{_html_safe(value)}</td></tr>"
+        for field, value in meta_rows
+    )
+    return f"<div class='table-wrap'><table>{rows}</table></div>"
+
+
+def _schema_object_html(title: str, obj: dict[str, str], fields: list[str]) -> str:
+    return (
+        "<div class='schema-card'>"
+        f"<div class='schema-card-title'>{_html_safe(title)}</div>"
+        f"{_kv_table_html(_schema_field_items(obj, fields))}"
+        "</div>"
+    )
+
+
+def _schema_sections_html(result: validator.UrlCheckResult) -> str:
+    if not (result.schema_objects or result.microdata_objects or result.rdfa_objects):
+        return "<div class='muted'>No structured data objects were captured.</div>"
+
+    chunks: list[str] = []
+    root_objects = [obj for obj in result.schema_objects if obj.get("source") in ("", None, "root")]
+    nested_objects = [obj for obj in result.schema_objects if obj.get("source") not in ("", None, "root")]
+    nested_by_parent: dict[str, list[dict[str, str]]] = {}
+    for obj in nested_objects:
+        source = obj.get("source", "")
+        parent = source.split(".", 1)[0] if source else "Unknown"
+        nested_by_parent.setdefault(parent, []).append(obj)
+
+    def root_key(obj: dict[str, str]) -> str:
+        type_field = obj.get("type", "")
+        return type_field.split(",", 1)[0].strip() if type_field else "Unknown"
+
+    if root_objects:
+        chunks.append("<div class='schema-section-title'>JSON-LD Root Objects</div>")
+        for root in root_objects:
+            label_type = root.get("type", "Object")
+            label_name = root.get("name", "")
+            label = f"{label_type} — {label_name}" if label_name else label_type
+            chunks.append(_schema_object_html(label, root, ["type"] + list(validator.SCHEMA_SUMMARY_FIELDS)))
+            for nested_obj in nested_by_parent.get(root_key(root), []):
+                nested_title = nested_obj.get("type", "Nested Object")
+                chunks.append(_schema_object_html(f"Nested: {nested_title}", nested_obj, list(validator.NESTED_SCHEMA_FIELDS)))
+
+    remaining_nested: list[dict[str, str]] = []
+    used_parents = {root_key(obj) for obj in root_objects}
+    for parent, items in nested_by_parent.items():
+        if parent not in used_parents:
+            remaining_nested.extend(items)
+    if remaining_nested:
+        chunks.append("<div class='schema-section-title'>JSON-LD Nested Objects (Other)</div>")
+        for nested_obj in remaining_nested:
+            nested_title = nested_obj.get("type", "Nested Object")
+            chunks.append(_schema_object_html(nested_title, nested_obj, list(validator.NESTED_SCHEMA_FIELDS)))
+
+    if result.microdata_objects:
+        chunks.append("<div class='schema-section-title'>Microdata Objects</div>")
+        for obj in result.microdata_objects:
+            chunks.append(_schema_object_html(obj.get("type", "Microdata Object"), obj, ["type"] + list(validator.SCHEMA_SUMMARY_FIELDS)))
+
+    if result.rdfa_objects:
+        chunks.append("<div class='schema-section-title'>RDFa Objects</div>")
+        for obj in result.rdfa_objects:
+            chunks.append(_schema_object_html(obj.get("type", "RDFa Object"), obj, ["type"] + list(validator.SCHEMA_SUMMARY_FIELDS)))
+
+    return "".join(chunks)
+
+
+def _url_detail_html(site: validator.SiteReport, result: validator.UrlCheckResult, expanded: bool = True) -> str:
+    issues, warnings = _url_findings(result)
+    recommendations = _recommendations_for_result(result)
+    schema_types = result.jsonld_types or []
+    open_attr = " open" if expanded else ""
+    return f"""
+<details class="accordion"{open_attr}>
+  <summary>{_html_safe(result.url)}</summary>
+  <div class="accordion-body">
+    <div class="top-grid">
+      <div class="info-card"><div class="info-label">Site</div><div class="info-value">{_html_safe(site.domain)}</div></div>
+      <div class="info-card"><div class="info-label">HTTP</div><div class="info-value">{_html_safe(result.http_status)}</div></div>
+      <div class="info-card"><div class="info-label">Indexability</div><div class="info-value">{_html_safe(result.indexability_status)}</div></div>
+      <div class="info-card"><div class="info-label">GSC</div><div class="info-value">{_html_safe(result.gsc_status)}</div></div>
+      <div class="info-card"><div class="info-label">Last Crawl</div><div class="info-value">{_html_safe(result.gsc_last_crawl_time)}</div></div>
+    </div>
+    <div class="summary-grid">
+      <div class="info-card"><div class="info-label">Content</div><div class="info-value">{_html_safe(_content_summary_text(result))}</div></div>
+      <div class="info-card"><div class="info-label">Canonical</div><div class="info-value">{_html_safe(result.seo_meta.get('canonical_url', '-') if result.seo_meta else '-')}</div></div>
+      <div class="info-card"><div class="info-label">Feature Image Alt</div><div class="info-value">{_html_safe(result.feature_image_alt or result.feature_image_status)}</div></div>
+    </div>
+    <div class="subheading">Metadata Snapshot</div>
+    {_meta_table_html(result)}
+    <div class="split">
+      <div>
+        <div class="subheading">Issues</div>
+        {_list_html(issues, "None")}
+      </div>
+      <div>
+        <div class="subheading">Warnings</div>
+        {_list_html(warnings, "None")}
+      </div>
+    </div>
+    <div class="split">
+      <div>
+        <div class="subheading">Schema Types</div>
+        {_list_html(schema_types, "None")}
+      </div>
+      <div>
+        <div class="subheading">Recommended Actions</div>
+        {_list_html(recommendations[:10], "No action items captured.")}
+      </div>
+    </div>
+    <div class="subheading">Schema Details</div>
+    {_schema_sections_html(result)}
+  </div>
+</details>
+"""
+
+
+def _report_table_html(report: validator.Report) -> str:
+    rows: list[str] = []
+    for site in report.sites:
+        for result in site.urls:
+            jsonld_summary = f"{result.jsonld_blocks} blocks"
+            if result.jsonld_types:
+                jsonld_summary += f" ({', '.join(sorted(set(result.jsonld_types))[:5])})"
+            rows.append(
+                "<tr>"
+                f"<td>{_html_safe(site.domain)}</td>"
+                f"<td>{_html_safe(result.url)}</td>"
+                f"<td>{_html_safe(result.http_status)}</td>"
+                f"<td>{_html_safe(result.indexability_status)}</td>"
+                f"<td>{_html_safe(result.gsc_status or '-')}</td>"
+                f"<td>{_html_safe(_content_summary_text(result))}</td>"
+                f"<td>{_html_safe(jsonld_summary)}</td>"
+                f"<td>{_html_safe(result.gsc_coverage_state or '-')}</td>"
+                "</tr>"
+            )
+    if not rows:
+        rows.append("<tr><td colspan='8' class='muted'>No URLs audited.</td></tr>")
+    return (
+        "<div class='table-wrap'><table>"
+        "<tr><th>Site</th><th>URL</th><th>HTTP</th><th>Indexability</th><th>GSC</th><th>Content</th><th>JSON-LD</th><th>Coverage</th></tr>"
+        + "".join(rows)
+        + "</table></div>"
+    )
+
+
+def _snapshot_shell(title: str, subtitle: str, body_html: str) -> str:
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(title)}</title>
+  <style>{_ui_snapshot_css()}</style>
+</head>
+<body>
+  <div class="page">
+    <div class="header-bar">
+      <div class="header-title">{html.escape(title)}</div>
+      <div class="header-sub">{html.escape(subtitle)}</div>
+    </div>
+    {body_html}
+  </div>
+</body>
+</html>"""
+
+
+def _build_url_snapshot_html(site: validator.SiteReport, result: validator.UrlCheckResult) -> str:
+    body_html = (
+        "<section class='section'>"
+        "<div class='section-title'>Run Results</div>"
+        "<div class='section-copy'>This PDF mirrors the tool UI with the URL accordion expanded so it can be shared exactly as a page-level audit.</div>"
+        f"{_url_detail_html(site, result, expanded=True)}"
+        "</section>"
+    )
+    return _snapshot_shell(
+        "Schema & Sitemap Validator",
+        "One run, full SEO audit with schema + sitemap insights.",
+        body_html,
+    )
+
+
+def _build_report_snapshot_html(report: validator.Report, summary: dict[str, object]) -> str:
+    top_metrics = "".join(
+        [
+            _metric_card_html("Overall Score", f"{summary.get('score', 0)}/100", f"Grade: {summary.get('grade', '-')}"),
+            _metric_card_html("SEO Score", f"{summary.get('seo_score', 0)}/100", f"Grade: {summary.get('seo_grade', '-')}"),
+            _metric_card_html("Schema Score", f"{summary.get('schema_score', 0)}/100", f"Grade: {summary.get('schema_grade', '-')}"),
+            _metric_card_html("Meta Coverage", f"{summary.get('meta_coverage_pct', 0)}%", f"Missing: {summary.get('meta_missing', 0)}"),
+            _metric_card_html("Canonical Mismatch", summary.get("canonical_mismatch", 0)),
+            _metric_card_html("Title/Desc Issues", summary.get("title_desc_issue_urls", 0)),
+            _metric_card_html("Schema Issues", summary.get("schema_issues", 0)),
+            _metric_card_html("URLs Tested", sum(len(site.urls) for site in report.sites)),
+        ]
+    )
+
+    gsc_metrics = ""
+    if report.gsc_enabled:
+        gsc_metrics = (
+            "<section class='section'>"
+            "<div class='section-title'>GSC Snapshot</div>"
+            "<div class='metrics metrics-4'>"
+            f"{_metric_card_html('GSC Indexed', summary.get('gsc_indexed_urls', 0))}"
+            f"{_metric_card_html('GSC Excluded', summary.get('gsc_excluded_urls', 0))}"
+            f"{_metric_card_html('GSC Blocked', summary.get('gsc_blocked_urls', 0))}"
+            f"{_metric_card_html('GSC Errors', summary.get('gsc_error_urls', 0))}"
+            "</div>"
+            "</section>"
+        )
+
+    site_sections: list[str] = []
+    for site in report.sites:
+        notes_html = ""
+        if site.notes:
+            notes_html = (
+                "<div class='subheading'>Site Notes</div>"
+                + _list_html(site.notes, "No site notes.")
+            )
+        sitemap_html = ""
+        sitemap_rows = _sitemap_snapshot_rows(site)
+        if sitemap_rows:
+            sitemap_html = (
+                "<div class='subheading'>Sitemap Snapshot</div>"
+                + _kv_table_html(sitemap_rows)
+            )
+        url_blocks = "".join(_url_detail_html(site, result, expanded=True) for result in site.urls)
+        site_sections.append(
+            "<section class='section'>"
+            f"<div class='site-heading'>{_html_safe(site.domain)}</div>"
+            f"<div class='compact muted'>Robots URL: {_html_safe(site.robots_url)} · Robots Status: {_html_safe(site.robots_status)} · URLs Audited: {len(site.urls)}</div>"
+            f"{notes_html}{sitemap_html}"
+            "<div class='subheading'>URLs</div>"
+            f"{url_blocks or '<div class=\"muted\">No URLs audited.</div>'}"
+            "</section>"
+        )
+
+    body_html = (
+        "<section class='section'>"
+        "<div class='section-title'>Run Results</div>"
+        "<div class='section-copy'>This PDF mirrors the tool UI with all URL accordions expanded, so the exported file reads like the on-screen audit and preserves Hindi/Unicode content.</div>"
+        f"<div class='metrics'>{top_metrics}</div>"
+        "</section>"
+        f"{gsc_metrics}"
+        "<section class='section'>"
+        "<div class='section-title'>URL Table</div>"
+        "<div class='section-copy'>Same table-style overview shown in the app before the detailed accordions.</div>"
+        f"{_report_table_html(report)}"
+        "</section>"
+        + "".join(site_sections)
+    )
+    return _snapshot_shell(
+        "Schema & Sitemap Validator",
+        "One run, full SEO audit with schema + sitemap insights.",
+        body_html,
+    )
+
+
+def _resolve_chromium_executable() -> str | None:
+    candidates = [
+        os.environ.get("PLAYWRIGHT_CHROMIUM_PATH", "").strip(),
+        os.environ.get("CHROMIUM_PATH", "").strip(),
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _png_to_pdf_bytes(png_path: Path) -> bytes:
+    image = Image.open(png_path).convert("RGB")
+    page_ratio = 297 / 210
+    slice_height = max(int(image.width * page_ratio), 1)
+    pages: list[Image.Image] = []
+    top = 0
+    while top < image.height:
+        bottom = min(top + slice_height, image.height)
+        pages.append(image.crop((0, top, image.width, bottom)).copy())
+        top = bottom
+
+    buffer = io.BytesIO()
+    pages[0].save(
+        buffer,
+        format="PDF",
+        save_all=True,
+        append_images=pages[1:],
+        resolution=144.0,
+    )
+    for page in pages:
+        page.close()
+    image.close()
+    return buffer.getvalue()
+
+
+def _render_html_to_pdf_bytes(html_content: str, title: str) -> bytes:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("UI PDF export requires the 'playwright' package.") from exc
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        html_path = Path(tmpdir) / "audit-snapshot.html"
+        png_path = Path(tmpdir) / "audit-snapshot.png"
+        html_path.write_text(html_content, encoding="utf-8")
+
+        launch_kwargs: dict[str, object] = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+        }
+        chromium_executable = _resolve_chromium_executable()
+        if chromium_executable:
+            launch_kwargs["executable_path"] = chromium_executable
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(**launch_kwargs)
+            try:
+                page = browser.new_page(
+                    viewport={"width": 1480, "height": 2000},
+                    device_scale_factor=2,
+                )
+                page.goto(html_path.as_uri(), wait_until="load")
+                page.emulate_media(media="screen")
+                page.wait_for_function("document.fonts ? document.fonts.status === 'loaded' : true")
+                page.wait_for_timeout(300)
+                page.screenshot(
+                    path=str(png_path),
+                    full_page=True,
+                    type="png",
+                )
+            finally:
+                browser.close()
+        return _png_to_pdf_bytes(png_path)
+
+
+def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) -> bytes:
+    try:
+        return _render_html_to_pdf_bytes(
+            _build_url_snapshot_html(site, result),
+            result.url,
+        )
+    except Exception:
+        return _build_url_pdf_reportlab(site, result)
+
+
+def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> bytes:
+    try:
+        return _render_html_to_pdf_bytes(
+            _build_report_snapshot_html(report, summary),
+            "SEO Audit Report",
+        )
+    except Exception:
+        return _build_report_pdf_reportlab(report, summary)
 
 
 st.set_page_config(page_title="Schema & Sitemap Validator", layout="wide")
