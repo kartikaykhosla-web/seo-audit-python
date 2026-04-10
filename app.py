@@ -2055,7 +2055,8 @@ label[data-testid="stWidgetLabel"] {
   border-radius: 12px;
   padding: 0.7rem 1.2rem;
   border: none;
-  width: 100%;
+  width: auto;
+  min-width: 110px;
   font-weight: 600;
   opacity: 1 !important;
 }
@@ -2088,6 +2089,9 @@ div[data-testid="stFormSubmitButton"] button * {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
   opacity: 1 !important;
+}
+div[data-testid="stFormSubmitButton"] button {
+  width: 100%;
 }
 button[data-testid="baseButton-primary"],
 button[data-testid="baseButton-primary"] * {
@@ -2438,39 +2442,36 @@ def render_url_detail_section(rows: list[dict[str, object]]) -> None:
         row_key = str(row["Row Key"])
         expander_label = result.url
         with st.expander(expander_label, expanded=False):
-            top_cols = st.columns([2.4, 1.2, 1.4, 1.2, 1.4], gap="small")
-            top_cols[0].markdown(f"**Site**  \n{site.domain}")
-            top_cols[1].markdown(f"**HTTP**  \n{row['HTTP']}")
-            top_cols[2].markdown(f"**Indexability**  \n{result.indexability_status or '-'}")
-            top_cols[3].markdown(f"**GSC**  \n{result.gsc_status or '-'}")
+            header_cols = st.columns([5, 1], gap="small")
+            overview_rows = [
+                ("Site", site.domain),
+                ("HTTP", row["HTTP"]),
+                ("Indexability", result.indexability_status or "-"),
+                ("GSC", result.gsc_status or "-"),
+                ("Canonical", result.seo_meta.get("canonical_url", "-") or "-"),
+                ("Last Crawl", result.gsc_last_crawl_time or "-"),
+                ("Content", _content_summary_text(result)),
+            ]
+            with header_cols[0]:
+                st.markdown("**Audit Snapshot**")
+                st.table(pd.DataFrame(overview_rows, columns=["Field", "Value"]))
             try:
                 url_pdf = build_url_pdf(site, result)
-                top_cols[4].download_button(
-                    "Download URL PDF",
+                header_cols[1].download_button(
+                    "PDF",
                     data=url_pdf,
                     file_name=f"url-audit-{site.domain}-{row_key.split('::')[-1]}.pdf",
                     mime="application/pdf",
                     key=f"url_pdf_detail_{row_key}",
-                    use_container_width=True,
+                    use_container_width=False,
                 )
             except Exception:
-                top_cols[4].button(
-                    "Download URL PDF",
+                header_cols[1].button(
+                    "PDF",
                     key=f"url_pdf_detail_disabled_{row_key}",
-                    use_container_width=True,
+                    use_container_width=False,
                     disabled=True,
                 )
-
-            summary_cols = st.columns(3, gap="small")
-            summary_cols[0].markdown(
-                f"**Content**  \n{_content_summary_text(result)}"
-            )
-            summary_cols[1].markdown(
-                f"**Canonical**  \n{result.seo_meta.get('canonical_url', '-') or '-'}"
-            )
-            summary_cols[2].markdown(
-                f"**Last Crawl**  \n{result.gsc_last_crawl_time or '-'}"
-            )
 
             meta_rows = _meta_snapshot_rows(result)
             if meta_rows:
