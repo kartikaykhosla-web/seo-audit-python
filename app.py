@@ -651,6 +651,183 @@ def _detail_blocks(story: list, modules: dict, styles, items: list[tuple[str, ob
     story.append(modules["Spacer"](1, 0.16 * modules["inch"]))
 
 
+def _schema_label(name: str) -> str:
+    return (
+        str(name or "")
+        .replace("_", " ")
+        .replace("Of", "of")
+        .replace("Url", "URL")
+        .title()
+    )
+
+
+def _schema_value_pairs(obj: dict[str, str]) -> list[tuple[str, str]]:
+    raw_pairs = str(obj.get("properties_used_values", "") or "")
+    output: list[tuple[str, str]] = []
+    for part in raw_pairs.split("||"):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        if ":" in cleaned:
+            key, value = cleaned.split(":", 1)
+        else:
+            key, value = cleaned, ""
+        output.append((key.strip(), value.strip()))
+    return output
+
+
+def _schema_field_items(obj: dict[str, str], fields: list[str]) -> list[tuple[str, object]]:
+    items: list[tuple[str, object]] = []
+    for field in fields:
+        value = obj.get(field, "")
+        if not value and field not in {
+            "properties_used",
+            "allowed_properties",
+            "missing_required",
+            "missing_recommended",
+            "source",
+        }:
+            continue
+        if field == "properties_used":
+            prop_pairs = _schema_value_pairs(obj)
+            if prop_pairs:
+                items.append(("Properties Used", "\n".join(f"{key}: {value}" for key, value in prop_pairs)))
+            else:
+                items.append(("Properties Used", value or "—"))
+            continue
+        if field == "allowed_properties":
+            count = obj.get("allowed_properties_count", "")
+            full_list = obj.get("allowed_properties_full", "") or value
+            if full_list:
+                prefix = f"{count} schema.org properties\n" if count else ""
+                items.append(("Allowed Properties", prefix + full_list))
+            else:
+                items.append(("Allowed Properties", "—"))
+            continue
+        items.append((_schema_label(field), value or "—"))
+    return items
+
+
+def _append_schema_object_card(
+    story: list,
+    modules: dict,
+    styles,
+    title: str,
+    obj: dict[str, str],
+    fields: list[str],
+) -> None:
+    story.append(modules["Paragraph"](_pdf_paragraph_text(title), styles["Heading3"]))
+    _detail_blocks(story, modules, styles, _schema_field_items(obj, fields))
+
+
+def _append_schema_details_section(
+    story: list,
+    modules: dict,
+    styles,
+    result: validator.UrlCheckResult,
+) -> None:
+    if not (result.schema_objects or result.microdata_objects or result.rdfa_objects):
+        story.append(modules["Paragraph"]("No structured data objects were captured.", styles["SmallBody"]))
+        story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+        return
+
+    root_objects = [
+        obj for obj in result.schema_objects if obj.get("source") in ("", None, "root")
+    ]
+    nested_objects = [
+        obj for obj in result.schema_objects if obj.get("source") not in ("", None, "root")
+    ]
+    nested_by_parent: dict[str, list[dict[str, str]]] = {}
+    for obj in nested_objects:
+        source = obj.get("source", "")
+        parent = source.split(".", 1)[0] if source else "Unknown"
+        nested_by_parent.setdefault(parent, []).append(obj)
+
+    def root_key(obj: dict[str, str]) -> str:
+        type_field = obj.get("type", "")
+        return type_field.split(",", 1)[0].strip() if type_field else "Unknown"
+
+    if root_objects:
+        story.append(
+            modules["Paragraph"](
+                _pdf_paragraph_text("JSON-LD Root Objects"),
+                styles["Heading3"],
+            )
+        )
+        story.append(modules["Spacer"](1, 0.04 * modules["inch"]))
+        for root in root_objects:
+            label_type = root.get("type", "Object")
+            label_name = root.get("name", "")
+            label = f"{label_type} — {label_name}" if label_name else label_type
+            _append_schema_object_card(
+                story,
+                modules,
+                styles,
+                label,
+                root,
+                ["type"] + list(validator.SCHEMA_SUMMARY_FIELDS),
+            )
+            parent_key = root_key(root)
+            nested = nested_by_parent.get(parent_key, [])
+            for nested_obj in nested:
+                nested_title = nested_obj.get("type", "Nested Object")
+                _append_schema_object_card(
+                    story,
+                    modules,
+                    styles,
+                    f"Nested: {nested_title}",
+                    nested_obj,
+                    list(validator.NESTED_SCHEMA_FIELDS),
+                )
+
+    remaining_nested = []
+    used_parents = {root_key(obj) for obj in root_objects}
+    for parent, items in nested_by_parent.items():
+        if parent not in used_parents:
+            remaining_nested.extend(items)
+    if remaining_nested:
+        story.append(
+            modules["Paragraph"](
+                _pdf_paragraph_text("JSON-LD Nested Objects (Other)"),
+                styles["Heading3"],
+            )
+        )
+        for nested_obj in remaining_nested:
+            nested_title = nested_obj.get("type", "Nested Object")
+            _append_schema_object_card(
+                story,
+                modules,
+                styles,
+                nested_title,
+                nested_obj,
+                list(validator.NESTED_SCHEMA_FIELDS),
+            )
+
+    if result.microdata_objects:
+        story.append(modules["Paragraph"](_pdf_paragraph_text("Microdata Objects"), styles["Heading3"]))
+        for obj in result.microdata_objects:
+            _append_schema_object_card(
+                story,
+                modules,
+                styles,
+                obj.get("type", "Microdata Object"),
+                obj,
+                ["type"] + list(validator.SCHEMA_SUMMARY_FIELDS),
+            )
+
+    if result.rdfa_objects:
+        story.append(modules["Paragraph"](_pdf_paragraph_text("RDFa Objects"), styles["Heading3"]))
+        for obj in result.rdfa_objects:
+            _append_schema_object_card(
+                story,
+                modules,
+                styles,
+                obj.get("type", "RDFa Object"),
+                obj,
+                ["type"] + list(validator.SCHEMA_SUMMARY_FIELDS),
+            )
+
+
 def _bullet_list(story: list, modules: dict, styles, values: list[str]) -> None:
     cleaned = [value.strip() for value in values if str(value).strip()]
     if not cleaned:
@@ -842,6 +1019,16 @@ def _append_url_report_sections(
         "Use these recommended actions to guide implementation or editorial fixes for this page.",
     )
     _bullet_list(story, modules, styles, _recommendations_for_result(result))
+    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Schema Details",
+        "This section expands the structured data captured for the URL, including root objects, nested objects, and key properties/values.",
+    )
+    _append_schema_details_section(story, modules, styles, result)
 
 
 def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) -> bytes:
