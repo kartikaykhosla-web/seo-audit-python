@@ -264,6 +264,11 @@ def build_sheets_service(service_account_json_path: str):
     return build("sheets", "v4", credentials=credentials, cache_discovery=False)
 
 
+def sheet_range(worksheet_name: str, a1_range: str) -> str:
+    escaped = str(worksheet_name).replace("'", "''")
+    return f"'{escaped}'!{a1_range}"
+
+
 def ensure_login_sheet(
     sheets_service,
     spreadsheet_id: str,
@@ -281,7 +286,7 @@ def ensure_login_sheet(
             body={"requests": [{"addSheet": {"properties": {"title": worksheet_name}}}]},
         ).execute()
 
-    header_range = f"{worksheet_name}!A1:C1"
+    header_range = sheet_range(worksheet_name, "A1:C1")
     existing = (
         sheets_service.spreadsheets()
         .values()
@@ -292,7 +297,7 @@ def ensure_login_sheet(
     if not existing:
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f"{worksheet_name}!A1",
+            range=sheet_range(worksheet_name, "A1"),
             valueInputOption="RAW",
             body={"values": [["date", "username", "logged_in_at"]]},
         ).execute()
@@ -312,7 +317,7 @@ def append_login_history_row(
     existing_rows = (
         sheets_service.spreadsheets()
         .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"{worksheet_name}!A:C")
+        .get(spreadsheetId=spreadsheet_id, range=sheet_range(worksheet_name, "A:C"))
         .execute()
         .get("values", [])
     )
@@ -328,7 +333,7 @@ def append_login_history_row(
     row = [target_row]
     sheets_service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range=f"{worksheet_name}!A1",
+        range=sheet_range(worksheet_name, "A1"),
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": row},
