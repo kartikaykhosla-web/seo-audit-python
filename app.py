@@ -309,7 +309,23 @@ def append_login_history_row(
         return
     sheets_service = build_sheets_service(service_account_json_path)
     ensure_login_sheet(sheets_service, spreadsheet_id, worksheet_name)
-    row = [[logged_in_at[:10], username, logged_in_at]]
+    existing_rows = (
+        sheets_service.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"{worksheet_name}!A:C")
+        .execute()
+        .get("values", [])
+    )
+    target_row = [logged_in_at[:10], username, logged_in_at]
+    for row in existing_rows[1:]:
+        candidate = [
+            row[0] if len(row) > 0 else "",
+            row[1] if len(row) > 1 else "",
+            row[2] if len(row) > 2 else "",
+        ]
+        if candidate == target_row:
+            return
+    row = [target_row]
     sheets_service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
         range=f"{worksheet_name}!A1",
