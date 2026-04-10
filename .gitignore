@@ -5,6 +5,7 @@ __pycache__/
 
 # Reports / outputs
 report.html
+indexing_monitor_config.local.json
 
 # Large schemaorg data (auto-downloadable)
 schemaorg-current-https.jsonld

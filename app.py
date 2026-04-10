@@ -359,9 +359,6 @@ def render_app_header(username: str) -> None:
             st.session_state.pop("logged_in_at", None)
             st.rerun()
 
-    if st.session_state.get("login_sheet_error"):
-        st.warning(friendly_login_sheet_error(st.session_state["login_sheet_error"]))
-
 
 def _pdf_modules():
     try:
@@ -372,6 +369,7 @@ def _pdf_modules():
         from reportlab.platypus import (
             ListFlowable,
             ListItem,
+            PageBreak,
             Paragraph,
             SimpleDocTemplate,
             Spacer,
@@ -395,6 +393,7 @@ def _pdf_modules():
         "TableStyle": TableStyle,
         "ListFlowable": ListFlowable,
         "ListItem": ListItem,
+        "PageBreak": PageBreak,
         "inch": inch,
     }
 
@@ -409,6 +408,15 @@ def _safe_text(value: object) -> str:
 def _build_pdf_story_helpers():
     modules = _pdf_modules()
     styles = modules["getSampleStyleSheet"]()
+    styles["Title"].fontName = "Helvetica-Bold"
+    styles["Title"].fontSize = 22
+    styles["Title"].leading = 26
+    styles["Title"].textColor = modules["colors"].HexColor("#0f172a")
+    styles["Heading3"].fontName = "Helvetica-Bold"
+    styles["Heading3"].fontSize = 11
+    styles["Heading3"].leading = 14
+    styles["Heading3"].spaceBefore = 8
+    styles["Heading3"].spaceAfter = 4
     styles.add(
         modules["ParagraphStyle"](
             name="SectionHeading",
@@ -422,6 +430,16 @@ def _build_pdf_story_helpers():
     )
     styles.add(
         modules["ParagraphStyle"](
+            name="LeadBody",
+            parent=styles["BodyText"],
+            fontSize=10,
+            leading=14,
+            textColor=modules["colors"].HexColor("#475569"),
+            spaceAfter=8,
+        )
+    )
+    styles.add(
+        modules["ParagraphStyle"](
             name="SmallBody",
             parent=styles["BodyText"],
             fontSize=9,
@@ -430,6 +448,12 @@ def _build_pdf_story_helpers():
         )
     )
     return modules, styles
+
+
+def _pdf_section_title(story: list, modules: dict, styles, title: str, intro: str = "") -> None:
+    story.append(modules["Paragraph"](title, styles["SectionHeading"]))
+    if intro:
+        story.append(modules["Paragraph"](intro, styles["LeadBody"]))
 
 
 def _kv_table(story: list, modules: dict, styles, items: list[tuple[str, object]]) -> None:
@@ -478,6 +502,58 @@ def _bullet_list(story: list, modules: dict, styles, values: list[str]) -> None:
     )
 
 
+def _content_summary_text(result: validator.UrlCheckResult) -> str:
+    parts: list[str] = []
+    if result.word_count:
+        source = f" ({result.word_count_source})" if result.word_count_source else ""
+        parts.append(f"{result.word_count} words{source}")
+    parts.append(
+        f"H1:{result.heading_h1_count} H2:{result.heading_h2_count} H3:{result.heading_h3_count}"
+    )
+    if result.feature_image_status:
+        parts.append(f"Feature image alt: {result.feature_image_status}")
+    return " | ".join(parts)
+
+
+def _recommendations_for_result(result: validator.UrlCheckResult) -> list[str]:
+    recommendations: list[str] = []
+    recommendations.extend(result.seo_issues)
+    recommendations.extend(result.seo_warnings)
+    recommendations.extend(result.issues)
+    recommendations.extend(result.warnings)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in recommendations:
+        cleaned = str(item).strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        deduped.append(cleaned)
+    return deduped
+
+
+def _meta_snapshot_rows(result: validator.UrlCheckResult) -> list[tuple[str, object]]:
+    meta = result.seo_meta or {}
+    preferred_keys = [
+        "title",
+        "meta_description",
+        "canonical_url",
+        "og:title",
+        "og:description",
+        "og:image",
+        "twitter:title",
+        "twitter:description",
+        "twitter:image",
+    ]
+    rows: list[tuple[str, object]] = []
+    for key in preferred_keys:
+        if meta.get(key):
+            rows.append((key, meta.get(key)))
+    if not rows and meta:
+        rows = sorted(meta.items())
+    return rows
+
+
 def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) -> bytes:
     modules, styles = _build_pdf_story_helpers()
     buffer = io.BytesIO()
@@ -492,9 +568,22 @@ def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) 
     )
     story: list = []
     story.append(modules["Paragraph"]("SEO Audit URL Report", styles["Title"]))
+    story.append(
+        modules["Paragraph"](
+            "A focused audit for one URL covering crawlability, on-page SEO, structured data, and GSC status.",
+            styles["LeadBody"],
+        )
+    )
     story.append(modules["Paragraph"](_safe_text(result.url), styles["SmallBody"]))
     story.append(modules["Spacer"](1, 0.18 * modules["inch"]))
 
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Executive Snapshot",
+        "This section gives a quick overview of how the page is performing at a glance.",
+    )
     _kv_table(
         story,
         modules,
@@ -503,36 +592,71 @@ def build_url_pdf(site: validator.SiteReport, result: validator.UrlCheckResult) 
             ("Site", site.domain),
             ("HTTP Status", result.http_status),
             ("Indexability", result.indexability_status),
+            ("Indexability Reasons", " | ".join(result.indexability_reasons) if result.indexability_reasons else "-"),
             ("Final URL", result.final_url),
             ("Canonical", result.seo_meta.get("canonical_url", "")),
             ("GSC Status", result.gsc_status),
             ("Coverage State", result.gsc_coverage_state),
+            ("Page Fetch State", result.gsc_page_fetch_state),
+            ("Robots State", result.gsc_robots_state),
             ("Last Crawl", result.gsc_last_crawl_time),
-            ("Word Count", result.word_count),
-            ("Word Count Source", result.word_count_source),
-            ("Heading Counts", f"H1:{result.heading_h1_count} H2:{result.heading_h2_count} H3:{result.heading_h3_count}"),
+            ("Content Summary", _content_summary_text(result)),
             ("Feature Image Alt", result.feature_image_alt or result.feature_image_status),
         ],
     )
 
-    story.append(modules["Paragraph"]("Meta Tags", styles["SectionHeading"]))
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "On-Page Metadata",
+        "These are the key SEO-facing meta fields captured from the page.",
+    )
     _kv_table(
         story,
         modules,
         styles,
-        sorted(result.seo_meta.items()) or [("Meta", "No meta fields captured")],
+        _meta_snapshot_rows(result) or [("Meta", "No meta fields captured")],
     )
 
-    story.append(modules["Paragraph"]("Issues", styles["SectionHeading"]))
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Issues",
+        "These are the strongest blockers or implementation gaps found for the page.",
+    )
     _bullet_list(story, modules, styles, result.issues)
     story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
 
-    story.append(modules["Paragraph"]("Warnings", styles["SectionHeading"]))
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Warnings",
+        "Warnings are lower-severity issues or optimisation opportunities.",
+    )
     _bullet_list(story, modules, styles, result.warnings)
     story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
 
-    story.append(modules["Paragraph"]("Schema Types", styles["SectionHeading"]))
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Structured Data Snapshot",
+        "A summary of JSON-LD/schema types found on the page.",
+    )
     _bullet_list(story, modules, styles, result.jsonld_types)
+
+    story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Recommended Actions",
+        "Use these points as the next fixes to improve indexability and SEO quality for this URL.",
+    )
+    _bullet_list(story, modules, styles, _recommendations_for_result(result))
 
     doc.build(story)
     return buffer.getvalue()
@@ -552,9 +676,22 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
     )
     story: list = []
     story.append(modules["Paragraph"]("SEO Audit Report", styles["Title"]))
+    story.append(
+        modules["Paragraph"](
+            "A consolidated report covering technical SEO, metadata, schema, sitemap quality, and GSC findings.",
+            styles["LeadBody"],
+        )
+    )
     story.append(modules["Paragraph"](f"Generated: {_safe_text(report.generated_at)}", styles["SmallBody"]))
     story.append(modules["Spacer"](1, 0.18 * modules["inch"]))
 
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Executive Summary",
+        "This section rolls up the main audit scores and topline outcomes across all analysed URLs.",
+    )
     _kv_table(
         story,
         modules,
@@ -569,17 +706,35 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
         ],
     )
 
-    story.append(modules["Paragraph"]("Highlights", styles["SectionHeading"]))
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Highlights",
+        "Quick takeaways from the run so a stakeholder can understand the state of the audit fast.",
+    )
     _bullet_list(story, modules, styles, [str(item) for item in summary.get("highlights", [])])
     story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
 
-    story.append(modules["Paragraph"]("Top Fixes", styles["SectionHeading"]))
+    _pdf_section_title(
+        story,
+        modules,
+        styles,
+        "Top Fixes",
+        "These are the most repeated fixes across the audited set and are good candidates for prioritisation.",
+    )
     fixes = [f"{message} ({count})" for message, count in summary.get("top_fixes", [])]
     _bullet_list(story, modules, styles, fixes)
     story.append(modules["Spacer"](1, 0.12 * modules["inch"]))
 
-    for site in report.sites:
-        story.append(modules["Paragraph"](f"Site: {site.domain}", styles["SectionHeading"]))
+    for site_index, site in enumerate(report.sites):
+        _pdf_section_title(
+            story,
+            modules,
+            styles,
+            f"Site Summary: {site.domain}",
+            "This section shows the robots and audit context for the site, followed by page-level summaries.",
+        )
         _kv_table(
             story,
             modules,
@@ -592,7 +747,7 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
                 ("URLs Audited", len(site.urls)),
             ],
         )
-        for result in site.urls:
+        for result_index, result in enumerate(site.urls):
             story.append(modules["Paragraph"](_safe_text(result.url), styles["Heading3"]))
             _kv_table(
                 story,
@@ -602,12 +757,17 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
                     ("HTTP Status", result.http_status),
                     ("Indexability", result.indexability_status),
                     ("GSC Status", result.gsc_status),
-                    ("Word Count", result.word_count),
-                    ("Headings", f"H1:{result.heading_h1_count} H2:{result.heading_h2_count} H3:{result.heading_h3_count}"),
+                    ("Coverage State", result.gsc_coverage_state),
+                    ("Content Summary", _content_summary_text(result)),
                     ("Feature Image Alt", result.feature_image_alt or result.feature_image_status),
                     ("Schema Types", ", ".join(result.jsonld_types) if result.jsonld_types else "-"),
+                    ("Key Findings", " | ".join(_recommendations_for_result(result)[:3]) or "-"),
                 ],
             )
+            if result_index < len(site.urls) - 1:
+                story.append(modules["Spacer"](1, 0.08 * modules["inch"]))
+        if site_index < len(report.sites) - 1:
+            story.append(modules["PageBreak"]())
 
     doc.build(story)
     return buffer.getvalue()
@@ -715,7 +875,7 @@ label[data-testid="stWidgetLabel"] {
 .stExpander {
   margin-top: 6px;
 }
-.stButton {
+.stButton, .stDownloadButton {
   margin-top: 6px;
 }
 div[data-testid="column"]:nth-child(2) .stNumberInput {
@@ -774,7 +934,7 @@ label[data-testid="stWidgetLabel"] {
   color: #475569 !important;
   opacity: 1 !important;
 }
-.stButton>button {
+.stButton>button, .stDownloadButton>button {
   background: #111827;
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
@@ -786,22 +946,26 @@ label[data-testid="stWidgetLabel"] {
   font-weight: 600;
   opacity: 1 !important;
 }
-.stButton>button * {
+.stButton>button *, .stDownloadButton>button * {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
   opacity: 1 !important;
 }
-.stButton>button span, .stButton>button p, .stButton>button div {
+.stButton>button span, .stButton>button p, .stButton>button div,
+.stDownloadButton>button span, .stDownloadButton>button p, .stDownloadButton>button div {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
 }
-.stButton button[kind], .stButton button[kind] * {
+.stButton button[kind], .stButton button[kind] *,
+.stDownloadButton button[kind], .stDownloadButton button[kind] * {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
   opacity: 1 !important;
 }
 div[data-testid="stForm"] .stButton > button,
-div[data-testid="stForm"] .stButton > button * {
+div[data-testid="stForm"] .stButton > button *,
+div[data-testid="stForm"] .stDownloadButton > button,
+div[data-testid="stForm"] .stDownloadButton > button * {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
   opacity: 1 !important;
@@ -819,19 +983,23 @@ button[data-testid="baseButton-primary"] * {
   opacity: 1 !important;
 }
 .stButton button,
-.stButton button * {
+.stButton button *,
+.stDownloadButton button,
+.stDownloadButton button * {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
   text-shadow: 0 0 0 #ffffff;
   opacity: 1 !important;
 }
 .stButton button:disabled,
-.stButton button:disabled * {
+.stButton button:disabled *,
+.stDownloadButton button:disabled,
+.stDownloadButton button:disabled * {
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
   opacity: 1 !important;
 }
-.stButton>button:hover {
+.stButton>button:hover, .stDownloadButton>button:hover {
   background: #111827 !important;
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
@@ -840,7 +1008,10 @@ button[data-testid="baseButton-primary"] * {
 }
 .stButton>button:active,
 .stButton>button:focus,
-.stButton>button:focus-visible {
+.stButton>button:focus-visible,
+.stDownloadButton>button:active,
+.stDownloadButton>button:focus,
+.stDownloadButton>button:focus-visible {
   background: #111827 !important;
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
@@ -848,7 +1019,9 @@ button[data-testid="baseButton-primary"] * {
   filter: none !important;
 }
 .stButton>button:disabled,
-.stButton>button[disabled] {
+.stButton>button[disabled],
+.stDownloadButton>button:disabled,
+.stDownloadButton>button[disabled] {
   background: #9ca3af !important;
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
@@ -856,7 +1029,9 @@ button[data-testid="baseButton-primary"] * {
   filter: none !important;
 }
 .stButton>button:disabled:hover,
-.stButton>button[disabled]:hover {
+.stButton>button[disabled]:hover,
+.stDownloadButton>button:disabled:hover,
+.stDownloadButton>button[disabled]:hover {
   background: #9ca3af !important;
   color: #ffffff !important;
   -webkit-text-fill-color: #ffffff !important;
@@ -1069,10 +1244,10 @@ def fetch_on_demand_gsc_status(report: validator.Report, result: validator.UrlCh
     st.session_state["latest_run_requested_gsc"] = True
 
 
-def render_gsc_action_table(report: validator.Report) -> None:
+def render_gsc_action_table(report: validator.Report) -> list[dict[str, object]]:
     gsc_rows = build_gsc_rows(report)
     if not gsc_rows:
-        return
+        return []
 
     filter_options = ["All", "Indexed", "Excluded", "Blocked", "Error", "No GSC Data", "Other"]
     gsc_filter = st.selectbox("Filter URLs by GSC status", filter_options, index=0)
@@ -1084,7 +1259,7 @@ def render_gsc_action_table(report: validator.Report) -> None:
     st.caption(f"Showing {len(filtered_rows)} of {len(gsc_rows)} audited URLs")
     if not filtered_rows:
         st.info("No URLs match the selected GSC filter.")
-        return
+        return []
 
     header_cols = st.columns([1.2, 4.3, 0.7, 1.2, 1.2, 1.5, 1.5, 1.2, 1.2], gap="small")
     header_labels = [
@@ -1133,6 +1308,93 @@ def render_gsc_action_table(report: validator.Report) -> None:
         except Exception:
             cols[8].button("PDF Off", key=f"url_pdf_off_{row_key}", use_container_width=True, disabled=True)
         st.divider()
+    return filtered_rows
+
+
+def render_url_detail_section(rows: list[dict[str, object]]) -> None:
+    if not rows:
+        return
+
+    st.subheader("Per-URL Audit Detail")
+    st.caption("Open any URL below to review the same audit findings in a readable format and download a URL-only PDF.")
+
+    for row in rows:
+        site = row["Site Report"]
+        result = row["Result"]
+        row_key = str(row["Row Key"])
+        expander_label = result.url
+        with st.expander(expander_label, expanded=False):
+            top_cols = st.columns([2.4, 1.2, 1.4, 1.2, 1.4], gap="small")
+            top_cols[0].markdown(f"**Site**  \n{site.domain}")
+            top_cols[1].markdown(f"**HTTP**  \n{row['HTTP']}")
+            top_cols[2].markdown(f"**Indexability**  \n{result.indexability_status or '-'}")
+            top_cols[3].markdown(f"**GSC**  \n{result.gsc_status or '-'}")
+            try:
+                url_pdf = build_url_pdf(site, result)
+                top_cols[4].download_button(
+                    "Download URL PDF",
+                    data=url_pdf,
+                    file_name=f"url-audit-{site.domain}-{row_key.split('::')[-1]}.pdf",
+                    mime="application/pdf",
+                    key=f"url_pdf_detail_{row_key}",
+                    use_container_width=True,
+                )
+            except Exception:
+                top_cols[4].button(
+                    "Download URL PDF",
+                    key=f"url_pdf_detail_disabled_{row_key}",
+                    use_container_width=True,
+                    disabled=True,
+                )
+
+            summary_cols = st.columns(3, gap="small")
+            summary_cols[0].markdown(
+                f"**Content**  \n{_content_summary_text(result)}"
+            )
+            summary_cols[1].markdown(
+                f"**Canonical**  \n{result.seo_meta.get('canonical_url', '-') or '-'}"
+            )
+            summary_cols[2].markdown(
+                f"**Last Crawl**  \n{result.gsc_last_crawl_time or '-'}"
+            )
+
+            meta_rows = _meta_snapshot_rows(result)
+            if meta_rows:
+                st.markdown("**Metadata Snapshot**")
+                st.table(pd.DataFrame(meta_rows, columns=["Field", "Value"]))
+
+            findings_col1, findings_col2 = st.columns(2, gap="large")
+            with findings_col1:
+                st.markdown("**Issues**")
+                if result.issues:
+                    for issue in result.issues:
+                        st.markdown(f"- {issue}")
+                else:
+                    st.markdown("- None")
+            with findings_col2:
+                st.markdown("**Warnings**")
+                if result.warnings:
+                    for warning in result.warnings:
+                        st.markdown(f"- {warning}")
+                else:
+                    st.markdown("- None")
+
+            schema_col1, schema_col2 = st.columns(2, gap="large")
+            with schema_col1:
+                st.markdown("**Schema Types**")
+                if result.jsonld_types:
+                    for schema_type in result.jsonld_types:
+                        st.markdown(f"- {schema_type}")
+                else:
+                    st.markdown("- None")
+            with schema_col2:
+                st.markdown("**Recommended Actions**")
+                recommendations = _recommendations_for_result(result)
+                if recommendations:
+                    for recommendation in recommendations[:10]:
+                        st.markdown(f"- {recommendation}")
+                else:
+                    st.markdown("- No action items captured.")
 
 with st.form("run_form"):
     col_a, col_b = st.columns([2.3, 1], gap="large")
@@ -1264,8 +1526,10 @@ if current_report and current_summary:
         row5[1].metric("Last GSC Crawl", summary.get("gsc_last_crawl", "-"))
         row5[1].caption("Latest crawl timestamp returned by Search Console")
 
+    filtered_gsc_rows: list[dict[str, object]] = []
     if gsc_rows:
-        render_gsc_action_table(current_report)
+        filtered_gsc_rows = render_gsc_action_table(current_report)
+        render_url_detail_section(filtered_gsc_rows)
 
     show_preview = st.checkbox("Show report preview", value=True, key="show_report_preview")
     if show_preview:
