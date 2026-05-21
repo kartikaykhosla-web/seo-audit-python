@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import threading
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image
 
 import validator
@@ -31,6 +33,22 @@ DEFAULT_PDF_FONT_BOLD_NAME = "AuditUnicodeBold"
 IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_LOGIN_SPREADSHEET_ID = "1-wGQoVKu0GqcsHJDT0pCIakEO-bIdXhzmV5ydn4kkNw"
 DEFAULT_LOGIN_WORKSHEET_NAME = "seo audit tool login"
+AUTO_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+
+def inject_auto_refresh(interval_ms: int = AUTO_REFRESH_INTERVAL_MS) -> None:
+    """Refresh the open Streamlit browser session on a fixed interval."""
+    components.html(
+        f"""
+        <script>
+        window.setTimeout(function () {{
+            window.parent.location.reload();
+        }}, {interval_ms});
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def parse_multiline(value: str) -> list[str]:
@@ -49,6 +67,13 @@ def dedupe(values: list[str]) -> list[str]:
         seen.add(value)
         output.append(value)
     return output
+
+
+def get_streamlit_secret(key: str, default=None):
+    try:
+        return st.secrets[key] if key in st.secrets else default
+    except Exception:
+        return default
 
 
 def classify_targets(values: list[str]) -> tuple[list[str], list[str], list[str]]:
@@ -93,10 +118,10 @@ def resolve_gsc_json_path() -> str:
         return str(default_path)
 
     secret_candidates = []
-    if "gsc_service_account" in st.secrets:
-        secret_candidates.append(st.secrets["gsc_service_account"])
-    if "gsc_service_account_json" in st.secrets:
-        secret_candidates.append(st.secrets["gsc_service_account_json"])
+    for secret_key in ("gsc_service_account", "gsc_service_account_json"):
+        secret_value = get_streamlit_secret(secret_key)
+        if secret_value:
+            secret_candidates.append(secret_value)
 
     env_json = os.environ.get("GSC_SERVICE_ACCOUNT_JSON", "").strip()
     if env_json:
@@ -183,10 +208,12 @@ def iter_report_urls(
 
 
 def resolve_login_spreadsheet_id() -> str:
-    if "seo_audit_login_spreadsheet_id" in st.secrets:
-        return str(st.secrets["seo_audit_login_spreadsheet_id"]).strip()
-    if "login_history_spreadsheet_id" in st.secrets:
-        return str(st.secrets["login_history_spreadsheet_id"]).strip()
+    secret_value = get_streamlit_secret("seo_audit_login_spreadsheet_id")
+    if secret_value:
+        return str(secret_value).strip()
+    secret_value = get_streamlit_secret("login_history_spreadsheet_id")
+    if secret_value:
+        return str(secret_value).strip()
     env_value = os.environ.get("SEO_AUDIT_LOGIN_SPREADSHEET_ID", "").strip()
     if env_value:
         return env_value
@@ -194,10 +221,12 @@ def resolve_login_spreadsheet_id() -> str:
 
 
 def resolve_login_worksheet_name() -> str:
-    if "seo_audit_login_worksheet_name" in st.secrets:
-        return str(st.secrets["seo_audit_login_worksheet_name"]).strip()
-    if "login_history_worksheet_name" in st.secrets:
-        return str(st.secrets["login_history_worksheet_name"]).strip()
+    secret_value = get_streamlit_secret("seo_audit_login_worksheet_name")
+    if secret_value:
+        return str(secret_value).strip()
+    secret_value = get_streamlit_secret("login_history_worksheet_name")
+    if secret_value:
+        return str(secret_value).strip()
     env_value = os.environ.get("SEO_AUDIT_LOGIN_WORKSHEET_NAME", "").strip()
     if env_value:
         return env_value
@@ -206,14 +235,15 @@ def resolve_login_worksheet_name() -> str:
 
 def resolve_login_service_account_json_path() -> str:
     secret_candidates = []
-    if "seo_audit_login_service_account" in st.secrets:
-        secret_candidates.append(st.secrets["seo_audit_login_service_account"])
-    if "seo_audit_login_service_account_json" in st.secrets:
-        secret_candidates.append(st.secrets["seo_audit_login_service_account_json"])
-    if "gsc_service_account" in st.secrets:
-        secret_candidates.append(st.secrets["gsc_service_account"])
-    if "gsc_service_account_json" in st.secrets:
-        secret_candidates.append(st.secrets["gsc_service_account_json"])
+    for secret_key in (
+        "seo_audit_login_service_account",
+        "seo_audit_login_service_account_json",
+        "gsc_service_account",
+        "gsc_service_account_json",
+    ):
+        secret_value = get_streamlit_secret(secret_key)
+        if secret_value:
+            secret_candidates.append(secret_value)
 
     env_json = os.environ.get("SEO_AUDIT_LOGIN_SERVICE_ACCOUNT_JSON", "").strip()
     if env_json:
@@ -372,24 +402,52 @@ def friendly_login_sheet_error(raw_error: str) -> str:
     return "Login logging could not be completed. Please verify the sheet ID and service-account access."
 
 
+def sync_login_history_once(
+    service_account_json_path: str,
+    spreadsheet_id: str,
+    worksheet_name: str,
+    username: str,
+    logged_in_at: str,
+) -> None:
+    sync_key = f"{username}::{logged_in_at}"
+    if (
+        st.session_state.get("login_sheet_sync_key") == sync_key
+        and st.session_state.get("login_sheet_sync_attempted")
+    ):
+        return
+
+    st.session_state["login_sheet_sync_key"] = sync_key
+    st.session_state["login_sheet_sync_attempted"] = True
+    st.session_state["login_sheet_synced"] = False
+
+    def worker() -> None:
+        try:
+            append_login_history_row(
+                service_account_json_path,
+                spreadsheet_id,
+                worksheet_name,
+                username,
+                logged_in_at,
+            )
+        except Exception as exc:
+            print(f"[seo-audit-login] background sync failed: {exc}")
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
 def require_login(service_account_json_path: str, spreadsheet_id: str, worksheet_name: str) -> tuple[str, str]:
     username = str(st.session_state.get("logged_in_username", "")).strip().lower()
     logged_in_at = str(st.session_state.get("logged_in_at", "")).strip()
     login_sheet_synced = bool(st.session_state.get("login_sheet_synced", False))
     if username and logged_in_at:
         if not login_sheet_synced:
-            try:
-                append_login_history_row(
-                    service_account_json_path,
-                    spreadsheet_id,
-                    worksheet_name,
-                    username,
-                    logged_in_at,
-                )
-                st.session_state["login_sheet_synced"] = True
-                st.session_state.pop("login_sheet_error", None)
-            except Exception as exc:
-                st.session_state["login_sheet_error"] = str(exc)
+            sync_login_history_once(
+                service_account_json_path,
+                spreadsheet_id,
+                worksheet_name,
+                username,
+                logged_in_at,
+            )
         return username, logged_in_at
 
     st.markdown(
@@ -414,18 +472,15 @@ def require_login(service_account_json_path: str, spreadsheet_id: str, worksheet
             st.session_state["logged_in_username"] = normalized
             st.session_state["logged_in_at"] = logged_in_at
             st.session_state["login_sheet_synced"] = False
-            try:
-                append_login_history_row(
-                    service_account_json_path,
-                    spreadsheet_id,
-                    worksheet_name,
-                    normalized,
-                    logged_in_at,
-                )
-                st.session_state["login_sheet_synced"] = True
-                st.session_state.pop("login_sheet_error", None)
-            except Exception as exc:
-                st.session_state["login_sheet_error"] = str(exc)
+            st.session_state.pop("login_sheet_sync_key", None)
+            st.session_state.pop("login_sheet_sync_attempted", None)
+            sync_login_history_once(
+                service_account_json_path,
+                spreadsheet_id,
+                worksheet_name,
+                normalized,
+                logged_in_at,
+            )
             st.rerun()
     st.stop()
 
@@ -448,6 +503,8 @@ def render_app_header(username: str) -> None:
             st.session_state.pop("logged_in_username", None)
             st.session_state.pop("logged_in_at", None)
             st.session_state.pop("login_sheet_synced", None)
+            st.session_state.pop("login_sheet_sync_key", None)
+            st.session_state.pop("login_sheet_sync_attempted", None)
             st.rerun()
 
 
@@ -1901,6 +1958,7 @@ def build_report_pdf(report: validator.Report, summary: dict[str, object]) -> by
 
 
 st.set_page_config(page_title="Schema & Sitemap Validator", layout="wide")
+inject_auto_refresh()
 
 st.markdown(
     """
@@ -2268,6 +2326,10 @@ if "latest_run_requested_gsc" not in st.session_state:
     st.session_state["latest_run_requested_gsc"] = False
 if "active_url_detail" not in st.session_state:
     st.session_state["active_url_detail"] = ""
+if "pdf_cache" not in st.session_state:
+    st.session_state["pdf_cache"] = {}
+if "pdf_errors" not in st.session_state:
+    st.session_state["pdf_errors"] = {}
 if "logged_in_username" not in st.session_state:
     st.session_state["logged_in_username"] = ""
 if "logged_in_at" not in st.session_state:
@@ -2279,6 +2341,53 @@ logged_in_username, logged_in_at = require_login(
     login_worksheet_name,
 )
 render_app_header(logged_in_username)
+
+
+def clear_generated_pdf_cache() -> None:
+    st.session_state["pdf_cache"] = {}
+    st.session_state["pdf_errors"] = {}
+
+
+def render_pdf_action(
+    container,
+    *,
+    cache_key: str,
+    prepare_label: str,
+    download_label: str,
+    file_name: str,
+    build_pdf,
+    button_key: str,
+    download_key: str,
+    use_container_width: bool = True,
+) -> None:
+    pdf_cache = st.session_state.setdefault("pdf_cache", {})
+    pdf_errors = st.session_state.setdefault("pdf_errors", {})
+
+    if cache_key in pdf_cache:
+        container.download_button(
+            download_label,
+            data=pdf_cache[cache_key],
+            file_name=file_name,
+            mime="application/pdf",
+            key=download_key,
+            use_container_width=use_container_width,
+        )
+        return
+
+    if container.button(
+        prepare_label,
+        key=button_key,
+        use_container_width=use_container_width,
+    ):
+        try:
+            pdf_cache[cache_key] = build_pdf()
+            pdf_errors.pop(cache_key, None)
+            st.rerun()
+        except Exception as exc:
+            pdf_errors[cache_key] = str(exc)
+
+    if cache_key in pdf_errors:
+        container.caption("PDF could not be prepared.")
 
 
 def run_validation_audit(
@@ -2347,6 +2456,8 @@ def run_validation_audit(
     st.session_state["latest_report"] = report
     st.session_state["latest_summary"] = summary
     st.session_state["latest_run_requested_gsc"] = include_gsc
+    st.session_state["active_url_detail"] = ""
+    clear_generated_pdf_cache()
     st.session_state["latest_run_config"] = {
         "targets_text": targets_text_value,
         "max_urls": max_urls_value,
@@ -2460,18 +2571,17 @@ def render_gsc_action_table(report: validator.Report) -> list[dict[str, object]]
                 st.rerun()
         else:
             cols[7].button("GSC Off", key=f"gsc_table_{row_key}", use_container_width=True, disabled=True)
-        try:
-            url_pdf = build_url_pdf(site, result)
-            cols[8].download_button(
-                "PDF",
-                data=url_pdf,
-                file_name=f"url-audit-{site.domain}-{row_key.split('::')[-1]}.pdf",
-                mime="application/pdf",
-                key=f"url_pdf_{row_key}",
-                use_container_width=True,
-            )
-        except Exception:
-            cols[8].button("PDF Off", key=f"url_pdf_off_{row_key}", use_container_width=True, disabled=True)
+        render_pdf_action(
+            cols[8],
+            cache_key=f"url::{row_key}",
+            prepare_label="Prepare",
+            download_label="PDF",
+            file_name=f"url-audit-{site.domain}-{row_key.split('::')[-1]}.pdf",
+            build_pdf=lambda site=site, result=result: build_url_pdf(site, result),
+            button_key=f"prepare_url_pdf_{row_key}",
+            download_key=f"url_pdf_{row_key}",
+            use_container_width=True,
+        )
         st.divider()
     return filtered_rows
 
@@ -2481,82 +2591,88 @@ def render_url_detail_section(rows: list[dict[str, object]]) -> None:
         return
 
     st.subheader("Per-URL Audit Detail")
-    st.caption("Open any URL below to review the same audit findings in a readable format and download a URL-only PDF.")
+    st.caption("Select one URL to inspect. PDF files are generated only when you request them.")
 
-    for row in rows:
-        site = row["Site Report"]
-        result = row["Result"]
-        row_key = str(row["Row Key"])
-        expander_label = result.url
-        with st.expander(expander_label, expanded=False):
-            snapshot_rows = [
-                ("Site", site.domain),
-                ("HTTP", row["HTTP"]),
-                ("Indexability", result.indexability_status or "-"),
-                ("GSC", result.gsc_status or "-"),
-                ("Canonical", result.seo_meta.get("canonical_url", "-") or "-"),
-                ("Last Crawl", result.gsc_last_crawl_time or "-"),
-                ("Content", _content_summary_text(result)),
-            ]
-            header_cols = st.columns([5, 1], gap="small")
-            with header_cols[0]:
-                st.markdown("**Audit Snapshot**")
-                st.markdown(_live_kv_table_html(snapshot_rows), unsafe_allow_html=True)
-            try:
-                url_pdf = build_url_pdf(site, result)
-                header_cols[1].download_button(
-                    "PDF",
-                    data=url_pdf,
-                    file_name=f"url-audit-{site.domain}-{row_key.split('::')[-1]}.pdf",
-                    mime="application/pdf",
-                    key=f"url_pdf_detail_{row_key}",
-                    use_container_width=False,
-                )
-            except Exception:
-                header_cols[1].button(
-                    "PDF",
-                    key=f"url_pdf_detail_disabled_{row_key}",
-                    use_container_width=False,
-                    disabled=True,
-                )
+    row_labels = [
+        f"{row['Site']} | {row['Result'].url}"
+        for row in rows
+    ]
+    if st.session_state.get("active_url_detail") not in row_labels:
+        st.session_state["active_url_detail"] = row_labels[0]
+    selected_label = st.selectbox(
+        "URL detail",
+        row_labels,
+        label_visibility="collapsed",
+        key="active_url_detail",
+    )
+    selected_index = row_labels.index(selected_label)
+    row = rows[selected_index]
+    site = row["Site Report"]
+    result = row["Result"]
+    row_key = str(row["Row Key"])
 
-            meta_rows = _meta_snapshot_rows(result)
-            if meta_rows:
-                st.markdown("**Metadata Snapshot**")
-                st.markdown(_live_kv_table_html(meta_rows), unsafe_allow_html=True)
+    snapshot_rows = [
+        ("Site", site.domain),
+        ("HTTP", row["HTTP"]),
+        ("Indexability", result.indexability_status or "-"),
+        ("GSC", result.gsc_status or "-"),
+        ("Canonical", result.seo_meta.get("canonical_url", "-") or "-"),
+        ("Last Crawl", result.gsc_last_crawl_time or "-"),
+        ("Content", _content_summary_text(result)),
+    ]
+    header_cols = st.columns([5, 1], gap="small")
+    with header_cols[0]:
+        st.markdown("**Audit Snapshot**")
+        st.markdown(_live_kv_table_html(snapshot_rows), unsafe_allow_html=True)
+    render_pdf_action(
+        header_cols[1],
+        cache_key=f"url::{row_key}",
+        prepare_label="Prepare PDF",
+        download_label="PDF",
+        file_name=f"url-audit-{site.domain}-{row_key.split('::')[-1]}.pdf",
+        build_pdf=lambda site=site, result=result: build_url_pdf(site, result),
+        button_key=f"prepare_url_pdf_detail_{row_key}",
+        download_key=f"url_pdf_detail_{row_key}",
+        use_container_width=False,
+    )
 
-            findings_col1, findings_col2 = st.columns(2, gap="large")
-            with findings_col1:
-                st.markdown("**Issues**")
-                if result.issues:
-                    for issue in result.issues:
-                        st.markdown(f"- {issue}")
-                else:
-                    st.markdown("- None")
-            with findings_col2:
-                st.markdown("**Warnings**")
-                if result.warnings:
-                    for warning in result.warnings:
-                        st.markdown(f"- {warning}")
-                else:
-                    st.markdown("- None")
+    meta_rows = _meta_snapshot_rows(result)
+    if meta_rows:
+        st.markdown("**Metadata Snapshot**")
+        st.markdown(_live_kv_table_html(meta_rows), unsafe_allow_html=True)
 
-            schema_col1, schema_col2 = st.columns(2, gap="large")
-            with schema_col1:
-                st.markdown("**Schema Types**")
-                if result.jsonld_types:
-                    for schema_type in result.jsonld_types:
-                        st.markdown(f"- {schema_type}")
-                else:
-                    st.markdown("- None")
-            with schema_col2:
-                st.markdown("**Recommended Actions**")
-                recommendations = _recommendations_for_result(result)
-                if recommendations:
-                    for recommendation in recommendations[:10]:
-                        st.markdown(f"- {recommendation}")
-                else:
-                    st.markdown("- No action items captured.")
+    findings_col1, findings_col2 = st.columns(2, gap="large")
+    with findings_col1:
+        st.markdown("**Issues**")
+        if result.issues:
+            for issue in result.issues:
+                st.markdown(f"- {issue}")
+        else:
+            st.markdown("- None")
+    with findings_col2:
+        st.markdown("**Warnings**")
+        if result.warnings:
+            for warning in result.warnings:
+                st.markdown(f"- {warning}")
+        else:
+            st.markdown("- None")
+
+    schema_col1, schema_col2 = st.columns(2, gap="large")
+    with schema_col1:
+        st.markdown("**Schema Types**")
+        if result.jsonld_types:
+            for schema_type in result.jsonld_types:
+                st.markdown(f"- {schema_type}")
+        else:
+            st.markdown("- None")
+    with schema_col2:
+        st.markdown("**Recommended Actions**")
+        recommendations = _recommendations_for_result(result)
+        if recommendations:
+            for recommendation in recommendations[:10]:
+                st.markdown(f"- {recommendation}")
+        else:
+            st.markdown("- No action items captured.")
 
 with st.form("run_form"):
     col_a, col_b = st.columns([2.3, 1], gap="large")
@@ -2651,23 +2767,17 @@ if current_report and current_summary:
 
     report_download_col, preview_hint_col = st.columns([1.4, 2.2])
     with report_download_col:
-        try:
-            report_pdf = build_report_pdf(current_report, summary)
-            st.download_button(
-                "Download Full Report (PDF)",
-                data=report_pdf,
-                file_name=f"seo-audit-report-{datetime.now(IST).strftime('%Y%m%d-%H%M%S')}.pdf",
-                mime="application/pdf",
-                key="download_full_report_pdf",
-                use_container_width=True,
-            )
-        except Exception:
-            st.button(
-                "Download Full Report (PDF)",
-                key="download_full_report_pdf_disabled",
-                use_container_width=True,
-                disabled=True,
-            )
+        render_pdf_action(
+            st,
+            cache_key="report::full",
+            prepare_label="Prepare Full Report (PDF)",
+            download_label="Download Full Report (PDF)",
+            file_name=f"seo-audit-report-{datetime.now(IST).strftime('%Y%m%d-%H%M%S')}.pdf",
+            build_pdf=lambda: build_report_pdf(current_report, summary),
+            button_key="prepare_full_report_pdf",
+            download_key="download_full_report_pdf",
+            use_container_width=True,
+        )
     with preview_hint_col:
         st.caption(
             "Use the PDF buttons in the URL table to download an individual URL audit. "
