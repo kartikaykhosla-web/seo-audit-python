@@ -33,7 +33,7 @@ DEFAULT_PDF_FONT_BOLD_NAME = "AuditUnicodeBold"
 IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_LOGIN_SPREADSHEET_ID = "1-wGQoVKu0GqcsHJDT0pCIakEO-bIdXhzmV5ydn4kkNw"
 DEFAULT_LOGIN_WORKSHEET_NAME = "seo audit tool login"
-AUTO_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000
+AUTO_REFRESH_INTERVAL_MS = 60 * 60 * 1000
 
 
 def inject_auto_refresh(interval_ms: int = AUTO_REFRESH_INTERVAL_MS) -> None:
