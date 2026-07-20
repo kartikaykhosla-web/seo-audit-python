@@ -34,6 +34,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_LOGIN_SPREADSHEET_ID = "1-wGQoVKu0GqcsHJDT0pCIakEO-bIdXhzmV5ydn4kkNw"
 DEFAULT_LOGIN_WORKSHEET_NAME = "seo audit tool login"
 AUTO_REFRESH_INTERVAL_MS = 60 * 60 * 1000
+APP_BUILD_LABEL = "GSC debug build 2026-07-20.1"
 
 
 def inject_auto_refresh(interval_ms: int = AUTO_REFRESH_INTERVAL_MS) -> None:
@@ -519,10 +520,11 @@ def render_app_header(username: str) -> None:
     title_col, action_col = st.columns([12, 1])
     with title_col:
         st.markdown(
-            """
+            f"""
 <div class="header-bar">
   <div class="header-title">Schema & Sitemap Validator</div>
   <div class="header-sub">One run, full SEO audit with schema + sitemap insights.</div>
+  <div class="header-sub" style="font-size:0.78rem;margin-top:0.2rem;">{APP_BUILD_LABEL}</div>
 </div>
 """,
             unsafe_allow_html=True,
@@ -2487,6 +2489,7 @@ def run_validation_audit(
     st.session_state["latest_summary"] = summary
     st.session_state["latest_run_requested_gsc"] = include_gsc
     st.session_state["active_url_detail"] = ""
+    st.session_state.pop("latest_gsc_refresh_message", None)
     clear_generated_pdf_cache()
     st.session_state["latest_run_config"] = {
         "targets_text": targets_text_value,
@@ -2598,6 +2601,12 @@ def fetch_on_demand_gsc_status(report: validator.Report, result: validator.UrlCh
             validator.save_gsc_cache(gsc_cache_path, cache)
 
     apply_gsc_result_to_url_result(result, gsc_result, gsc_property)
+    if result.gsc_error:
+        st.session_state["latest_gsc_refresh_message"] = f"{result.url}: {result.gsc_error}"
+    else:
+        st.session_state["latest_gsc_refresh_message"] = (
+            f"{result.url}: {result.gsc_status or 'GSC status returned'} via {result.gsc_property or gsc_property}"
+        )
     report.gsc_enabled = bool(service)
     st.session_state["latest_report"] = report
     st.session_state["latest_summary"] = validator.compute_executive_summary(report)
@@ -2608,6 +2617,13 @@ def render_gsc_action_table(report: validator.Report) -> list[dict[str, object]]
     gsc_rows = build_gsc_rows(report)
     if not gsc_rows:
         return []
+
+    latest_refresh_message = str(st.session_state.get("latest_gsc_refresh_message", "") or "").strip()
+    if latest_refresh_message:
+        if "error" in latest_refresh_message.lower() or "failed" in latest_refresh_message.lower():
+            st.error(latest_refresh_message)
+        else:
+            st.success(latest_refresh_message)
 
     filter_options = ["All", "Indexed", "Excluded", "Blocked", "Error", "No GSC Data", "Other"]
     gsc_filter = st.selectbox("Filter URLs by GSC status", filter_options, index=0)
