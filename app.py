@@ -2469,6 +2469,25 @@ def report_candidate_domains(report: validator.Report) -> list[str]:
     return [site.domain for site in report.sites]
 
 
+def gsc_property_candidates(url: str, candidate_domains: list[str]) -> list[str]:
+    candidates: list[str] = []
+    mapped_property = validator.infer_gsc_property(url, candidate_domains)
+    if mapped_property:
+        candidates.append(mapped_property)
+
+    raw_host = (validator.extract_domain(url) or "").strip().lower()
+    normalized_host = validator.normalize_gsc_domain(raw_host)
+    if normalized_host:
+        candidates.append(f"sc-domain:{normalized_host}")
+
+    for domain in candidate_domains:
+        normalized_domain = validator.normalize_gsc_domain(str(domain or ""))
+        if normalized_domain and (not normalized_host or normalized_host == normalized_domain or normalized_host.endswith("." + normalized_domain)):
+            candidates.append(f"sc-domain:{normalized_domain}")
+
+    return dedupe(candidates)
+
+
 def apply_gsc_result_to_url_result(
     result: validator.UrlCheckResult, gsc_result: dict[str, object], gsc_property: str
 ) -> None:
@@ -2499,8 +2518,8 @@ def fetch_on_demand_gsc_status(report: validator.Report, result: validator.UrlCh
             "checked_at": "",
         }
     else:
-        gsc_property = validator.infer_gsc_property(result.url, report_candidate_domains(report))
-        if not gsc_property:
+        candidate_properties = gsc_property_candidates(result.url, report_candidate_domains(report))
+        if not candidate_properties:
             gsc_result = {
                 "status": "",
                 "property": "",
@@ -2508,8 +2527,19 @@ def fetch_on_demand_gsc_status(report: validator.Report, result: validator.UrlCh
                 "checked_at": "",
             }
         else:
-            gsc_result = validator.inspect_url_in_gsc(service, result.url, gsc_property)
+            attempted_errors = []
             cache = validator.load_gsc_cache(gsc_cache_path)
+            for candidate_property in candidate_properties:
+                candidate_result = validator.inspect_url_in_gsc(service, result.url, candidate_property)
+                if not candidate_result.get("error"):
+                    gsc_property = candidate_property
+                    gsc_result = candidate_result
+                    break
+                attempted_errors.append(f"{candidate_property}: {candidate_result.get('error')}")
+                gsc_property = candidate_property
+                gsc_result = candidate_result
+            if gsc_result.get("error") and attempted_errors:
+                gsc_result["error"] = " | ".join(attempted_errors)
             validator.set_cached_gsc_result(cache, gsc_property, result.url, gsc_result)
             validator.save_gsc_cache(gsc_cache_path, cache)
 
@@ -2537,7 +2567,7 @@ def render_gsc_action_table(report: validator.Report) -> list[dict[str, object]]
         st.info("No URLs match the selected GSC filter.")
         return []
 
-    header_cols = st.columns([1.2, 4.3, 0.7, 1.2, 1.2, 1.5, 1.5, 1.2, 1.2], gap="small")
+    header_cols = st.columns([1.2, 4.1, 0.7, 1.1, 1.1, 1.4, 1.4, 2.2, 1.2, 1.2], gap="small")
     header_labels = [
         "Site",
         "URL",
@@ -2546,6 +2576,7 @@ def render_gsc_action_table(report: validator.Report) -> list[dict[str, object]]
         "GSC Status",
         "Coverage State",
         "Indexing State",
+        "GSC Error",
         "GSC",
         "PDF",
     ]
@@ -2557,7 +2588,7 @@ def render_gsc_action_table(report: validator.Report) -> list[dict[str, object]]
         result = row["Result"]
         row_key = str(row["Row Key"])
         button_label = "Refresh GSC" if (result.gsc_status or result.gsc_error) else "Fetch GSC"
-        cols = st.columns([1.2, 4.3, 0.7, 1.2, 1.2, 1.5, 1.5, 1.2, 1.2], gap="small")
+        cols = st.columns([1.2, 4.1, 0.7, 1.1, 1.1, 1.4, 1.4, 2.2, 1.2, 1.2], gap="small")
         cols[0].write(str(row["Site"]))
         cols[1].markdown(f"[{result.url}]({result.url})")
         cols[2].write(str(row["HTTP"]))
@@ -2565,14 +2596,15 @@ def render_gsc_action_table(report: validator.Report) -> list[dict[str, object]]
         cols[4].write(str(row["GSC Status"]))
         cols[5].write(str(row["Coverage State"]))
         cols[6].write(str(row["Indexing State"]))
+        cols[7].caption(str(row["GSC Error"]))
         if gsc_json_path:
-            if cols[7].button(button_label, key=f"gsc_table_{row_key}", use_container_width=True):
+            if cols[8].button(button_label, key=f"gsc_table_{row_key}", use_container_width=True):
                 fetch_on_demand_gsc_status(st.session_state["latest_report"], result)
                 st.rerun()
         else:
-            cols[7].button("GSC Off", key=f"gsc_table_{row_key}", use_container_width=True, disabled=True)
+            cols[8].button("GSC Off", key=f"gsc_table_{row_key}", use_container_width=True, disabled=True)
         render_pdf_action(
-            cols[8],
+            cols[9],
             cache_key=f"url::{row_key}",
             prepare_label="Prepare",
             download_label="PDF",
