@@ -34,7 +34,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 DEFAULT_LOGIN_SPREADSHEET_ID = "1-wGQoVKu0GqcsHJDT0pCIakEO-bIdXhzmV5ydn4kkNw"
 DEFAULT_LOGIN_WORKSHEET_NAME = "seo audit tool login"
 AUTO_REFRESH_INTERVAL_MS = 60 * 60 * 1000
-APP_BUILD_LABEL = "GSC debug build 2026-07-20.1"
+APP_BUILD_LABEL = "Blue title build 2026-07-20.2"
 
 
 def inject_auto_refresh(interval_ms: int = AUTO_REFRESH_INTERVAL_MS) -> None:
@@ -1377,6 +1377,7 @@ body {{
 .header-title {{
   font-size: 24px;
   font-weight: 700;
+  color: #2563eb;
   line-height: 1.25;
 }}
 .header-sub {{
@@ -2045,7 +2046,7 @@ div[data-testid="stForm"] {
   font-family: 'Libre Franklin', sans-serif;
   font-size: 24px;
   font-weight: 600;
-  color: #0f172a;
+  color: #2563eb;
   line-height: 1.25;
   padding-top: 2px;
 }
