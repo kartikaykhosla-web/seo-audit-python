@@ -168,6 +168,21 @@ def classify_gsc_bucket(result: validator.UrlCheckResult) -> str:
     return "Other"
 
 
+def compact_cell_value(value: object, fallback: str = "N/A", limit: int = 160) -> str:
+    text = str(value or "").strip()
+    if not text or text == "-":
+        return fallback
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def gsc_status_display(result: validator.UrlCheckResult) -> str:
+    if result.gsc_error:
+        return compact_cell_value(f"Error: {result.gsc_error}", limit=220)
+    return compact_cell_value(result.gsc_status)
+
+
 def build_gsc_rows(report: validator.Report) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for site in report.sites:
@@ -181,17 +196,17 @@ def build_gsc_rows(report: validator.Report) -> list[dict[str, object]]:
                     "Result": result,
                     "HTTP": result.http_status or "-",
                     "GSC Category": classify_gsc_bucket(result),
-                    "GSC Status": result.gsc_status or "-",
-                    "Coverage State": result.gsc_coverage_state or "-",
-                    "Indexing State": result.gsc_indexing_state or "-",
-                    "Robots State": result.gsc_robots_state or "-",
-                    "Page Fetch State": result.gsc_page_fetch_state or "-",
-                    "Last Inspected": result.gsc_checked_at or "-",
-                    "Last Crawl": result.gsc_last_crawl_time or "-",
-                    "Google Canonical": result.gsc_google_canonical or "-",
-                    "User Canonical": result.gsc_user_canonical or "-",
-                    "GSC Property": result.gsc_property or "-",
-                    "GSC Error": result.gsc_error or "-",
+                    "GSC Status": gsc_status_display(result),
+                    "Coverage State": compact_cell_value(result.gsc_coverage_state),
+                    "Indexing State": compact_cell_value(result.gsc_indexing_state),
+                    "Robots State": compact_cell_value(result.gsc_robots_state),
+                    "Page Fetch State": compact_cell_value(result.gsc_page_fetch_state),
+                    "Last Inspected": compact_cell_value(result.gsc_checked_at),
+                    "Last Crawl": compact_cell_value(result.gsc_last_crawl_time),
+                    "Google Canonical": compact_cell_value(result.gsc_google_canonical),
+                    "User Canonical": compact_cell_value(result.gsc_user_canonical),
+                    "GSC Property": compact_cell_value(result.gsc_property),
+                    "GSC Error": compact_cell_value(result.gsc_error),
                 }
             )
     return rows
@@ -2589,13 +2604,13 @@ def render_gsc_action_table(report: validator.Report) -> list[dict[str, object]]
         row_key = str(row["Row Key"])
         button_label = "Refresh GSC" if (result.gsc_status or result.gsc_error) else "Fetch GSC"
         cols = st.columns([1.2, 4.1, 0.7, 1.1, 1.1, 1.4, 1.4, 2.2, 1.2, 1.2], gap="small")
-        cols[0].write(str(row["Site"]))
+        cols[0].text(str(row["Site"]))
         cols[1].markdown(f"[{result.url}]({result.url})")
-        cols[2].write(str(row["HTTP"]))
-        cols[3].write(str(row["GSC Category"]))
-        cols[4].write(str(row["GSC Status"]))
-        cols[5].write(str(row["Coverage State"]))
-        cols[6].write(str(row["Indexing State"]))
+        cols[2].text(str(row["HTTP"]))
+        cols[3].text(str(row["GSC Category"]))
+        cols[4].text(str(row["GSC Status"]))
+        cols[5].text(str(row["Coverage State"]))
+        cols[6].text(str(row["Indexing State"]))
         cols[7].caption(str(row["GSC Error"]))
         if gsc_json_path:
             if cols[8].button(button_label, key=f"gsc_table_{row_key}", use_container_width=True):
