@@ -183,6 +183,21 @@ def gsc_status_display(result: validator.UrlCheckResult) -> str:
     return compact_cell_value(result.gsc_status)
 
 
+def gsc_site_url_domain(site_url: str) -> str:
+    value = str(site_url or "").strip().lower()
+    if value.startswith("sc-domain:"):
+        return validator.normalize_gsc_domain(value.replace("sc-domain:", "", 1))
+    return validator.normalize_gsc_domain(validator.extract_domain(value) or "")
+
+
+def gsc_site_matches_url(site_url: str, url: str) -> bool:
+    site_domain = gsc_site_url_domain(site_url)
+    url_domain = validator.normalize_gsc_domain(validator.extract_domain(url) or "")
+    if not site_domain or not url_domain:
+        return False
+    return url_domain == site_domain or url_domain.endswith("." + site_domain)
+
+
 def build_gsc_rows(report: validator.Report) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for site in report.sites:
@@ -2484,8 +2499,26 @@ def report_candidate_domains(report: validator.Report) -> list[str]:
     return [site.domain for site in report.sites]
 
 
-def gsc_property_candidates(url: str, candidate_domains: list[str]) -> list[str]:
+def accessible_gsc_site_urls(service) -> tuple[list[str], str]:
+    try:
+        response = service.sites().list().execute()
+        entries = response.get("siteEntry", []) if isinstance(response, dict) else []
+        site_urls = [
+            str(entry.get("siteUrl", "") or "").strip()
+            for entry in entries
+            if isinstance(entry, dict) and entry.get("siteUrl")
+        ]
+        return dedupe(site_urls), ""
+    except Exception as exc:
+        return [], str(exc)
+
+
+def gsc_property_candidates(url: str, candidate_domains: list[str], accessible_site_urls: list[str] | None = None) -> list[str]:
     candidates: list[str] = []
+    for site_url in accessible_site_urls or []:
+        if gsc_site_matches_url(site_url, url):
+            candidates.append(site_url)
+
     mapped_property = validator.infer_gsc_property(url, candidate_domains)
     if mapped_property:
         candidates.append(mapped_property)
@@ -2533,12 +2566,16 @@ def fetch_on_demand_gsc_status(report: validator.Report, result: validator.UrlCh
             "checked_at": "",
         }
     else:
-        candidate_properties = gsc_property_candidates(result.url, report_candidate_domains(report))
+        accessible_sites, accessible_error = accessible_gsc_site_urls(service)
+        candidate_properties = gsc_property_candidates(result.url, report_candidate_domains(report), accessible_sites)
         if not candidate_properties:
+            error_text = "No matching GSC property is accessible to the configured service account"
+            if accessible_error:
+                error_text = f"Could not list accessible GSC properties: {accessible_error}"
             gsc_result = {
                 "status": "",
                 "property": "",
-                "error": "No GSC property mapping configured for this domain",
+                "error": error_text,
                 "checked_at": "",
             }
         else:
@@ -2555,6 +2592,8 @@ def fetch_on_demand_gsc_status(report: validator.Report, result: validator.UrlCh
                 gsc_result = candidate_result
             if gsc_result.get("error") and attempted_errors:
                 gsc_result["error"] = " | ".join(attempted_errors)
+            if accessible_sites:
+                gsc_result["accessible_gsc_sites"] = accessible_sites
             validator.set_cached_gsc_result(cache, gsc_property, result.url, gsc_result)
             validator.save_gsc_cache(gsc_cache_path, cache)
 
